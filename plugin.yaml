@@ -1,0 +1,36 @@
+name: hermes-discord-plugin
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: "Render Hermes Agent's Discord replies as embeds, with the model name in the footer."
+author: rogafe
+kind: standalone
+platforms: [linux, macos, windows]
+tags: [gateway, discord]
+
+provides_hooks:
+  - post_llm_call
+
+# No extra Python dependencies: discord.py ships with Hermes' Discord adapter.
+requires_env: []
+
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    label: "Render replies as embeds"
+  footer_template:
+    type: str
+    default: "{model}"
+    label: "Footer template"
+    description: "Embed footer text. Placeholders: {model} (vendor prefix dropped), {model_full}."
+  color:
+    type: str
+    default: "#5865F2"
+    label: "Embed color"
+    description: "Hex color of the embed's left bar, e.g. #5865F2."
+  embed_non_model_replies:
+    type: bool
+    default: false
+    label: "Embed non-model replies"
+    description: "Also render final replies that no model produced (slash-command output, errors) as embeds, without a footer."
