@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
+from .chunking import split_markdown
 from .message_model import MessageDocument, Offer, Segment
 from .interaction_router import InteractionRouter
 from .models import ModelTracker
@@ -18,6 +19,9 @@ from .render import build_embed_dict, build_offer_embed_dict, build_report_embed
 from .state_store import RECOVERY_GRACE_SECONDS, OfferStateStore
 
 logger = logging.getLogger(__name__)
+
+MESSAGE_LIMIT = 2000   # Discord plain-message cap, used when the adapter does not expose its own
+CHUNK_HEADROOM = 100
 
 _STATE_ATTR = "_hermes_discord_embeds"
 GetSetting = Callable[[str, Any], Any]
@@ -71,6 +75,16 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
                     state, original_send, chat_id, document, reply_to, metadata,
                 )
 
+        if (
+            isinstance(content, str)
+            and bool(metadata and metadata.get("notify"))
+            and _setting_bool(get_setting, "enabled", True)
+            and _setting_bool(get_setting, "long_reply_chunking", True)
+        ):
+            chunked = await _send_chunked_reply(state, original_send, chat_id, content, reply_to, metadata)
+            if chunked is not None:
+                return chunked
+
         result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
         if bool(metadata and metadata.get("notify")) and getattr(result, "success", False):
             await _embed_reply(
@@ -91,6 +105,56 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
     adapter.edit_message = edit_message
     _install_interaction_listener(state)
     logger.info("hermes-discord-plugin: final Discord replies will render as embeds")
+
+
+async def _send_chunked_reply(
+    state: _AdapterState, original_send: Callable, chat_id: Any, content: str,
+    reply_to: Any, metadata: Optional[dict],
+) -> Any:
+    """Pre-split a long final reply on Markdown boundaries; ``None`` leaves it to the adapter.
+
+    The adapter would cut at its message limit mid-sentence; sending fragments that already fit
+    makes its own splitting a no-op while it keeps the reply reference, ledger and retries.
+    """
+    adapter = state.adapter
+    max_length = _positive_int(getattr(adapter, "MAX_MESSAGE_LENGTH", None), MESSAGE_LIMIT)
+    if len(content) <= max_length:
+        return None
+    document = parse_message(content)
+    if document.segments and document.segments[0].kind in {"alert", "confirmation"}:
+        return None
+    # Headroom for the adapter's own reformatting (table conversion) so it never re-splits.
+    chunks = split_markdown(content, max_length - CHUNK_HEADROOM)
+    # Beyond the adapter's flood cap its truncation notice is the right behaviour.
+    if len(chunks) < 2 or len(chunks) > _positive_int(getattr(adapter, "MAX_SPLIT_MESSAGES", None), 8):
+        return None
+    import discord
+
+    channel = await _resolve_channel(state.bot, _route_keys(chat_id, metadata))
+    if isinstance(channel, discord.ForumChannel):
+        return None  # a forum send creates one post per call; fragments would become separate posts
+    ids: list[str] = []
+    result = None
+    for index, chunk in enumerate(chunks):
+        result = await original_send(
+            chat_id, chunk, reply_to=reply_to if index == 0 else None, metadata=metadata,
+        )
+        if not getattr(result, "success", False):
+            logger.warning("hermes-discord-plugin: chunked reply delivery failed at part %d", index + 1)
+            return result
+        ids.extend(_sent_message_ids(result))
+    if ids:
+        try:
+            result.message_id = ids[0]
+            raw = getattr(result, "raw_response", None)
+            if isinstance(raw, dict):
+                raw["message_ids"] = ids
+            else:
+                result.raw_response = {"message_ids": ids}
+        except Exception:
+            logger.warning("hermes-discord-plugin: adapter send result could not be aggregated")
+        await _embed_reply(state, chat_id=chat_id, metadata=metadata, message_ids=ids)
+    return result
 
 
 async def _send_cron_offer_segments(
@@ -912,6 +976,10 @@ def _component_auth_checker(adapter: Any) -> Any:
 
     module = sys.modules.get(type(adapter).__module__)
     return getattr(module, "_component_check_auth", None) if module else None
+
+
+def _positive_int(value: Any, default: int) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else default
 
 
 def _setting_int(get_setting: GetSetting, key: str, default: int) -> int:
