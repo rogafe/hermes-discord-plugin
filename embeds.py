@@ -567,6 +567,7 @@ async def _handle_note_modal(interaction: Any) -> None:
             f"{number} 🗒️ Remarque (job_id: {job_id}) : {note_text}",
         )
         committed = True
+        state.offer_store.commit_note(message_id, job_id, int(number))
         await interaction.followup.send(
             f"Remarque transmise à Hermes pour l’offre {number}.", ephemeral=True,
         )
@@ -620,8 +621,10 @@ def _claim_blocked_message(
     """
     subject = "remarque" if note else "action"
     if note:
-        created_at = state.offer_store.note_status(message_id, job_id, offer_number)
-        record_state, elapsed = "pending", created_at
+        status = state.offer_store.note_status(message_id, job_id, offer_number)
+        if status is None:
+            return fallback
+        record_state, elapsed = status
     else:
         status = state.offer_store.claim_status(message_id, job_id, offer_number)
         if status is None:

@@ -52,8 +52,7 @@ class PageStore:
                 self._memory_pages[str(message_id)] = (str(channel_id), str(job_id), list(pages), str(footer))
                 return True
             try:
-                if due:
-                    self._prune_connection(connection, PAGE_RETENTION_SECONDS, PAGE_ROW_LIMIT)
+                self._ensure_schema(connection)
                 payload = _encode_pages(pages)
                 connection.execute(
                     "INSERT OR REPLACE INTO hermes_discord_report_pages "
@@ -62,6 +61,9 @@ class PageStore:
                     (str(message_id), str(channel_id), str(job_id), len(pages), payload,
                      str(footer), int(time.time())),
                 )
+                if due:
+                    # After the insert, so the newest report always counts toward the row limit.
+                    self._prune_connection(connection, PAGE_RETENTION_SECONDS, PAGE_ROW_LIMIT)
                 connection.commit()
                 return True
             except Exception:
@@ -89,11 +91,13 @@ class PageStore:
             try:
                 self._ensure_schema(connection)
                 self._prune_connection(connection, max_age_seconds, max_rows)
+                connection.commit()
             except Exception:
                 logger.debug("hermes-discord-plugin: could not prune pagination state", exc_info=True)
 
     @staticmethod
     def _prune_connection(connection: Any, max_age_seconds: int, max_rows: int) -> None:
+        """Delete expired rows, then rows beyond the newest ``max_rows`` (caller commits)."""
         cutoff = int(time.time()) - int(max_age_seconds)
         connection.execute(
             "DELETE FROM hermes_discord_report_pages WHERE created_at < ?", (cutoff,),
@@ -101,7 +105,7 @@ class PageStore:
         connection.execute(
             "DELETE FROM hermes_discord_report_pages WHERE message_id NOT IN ("
             "SELECT message_id FROM hermes_discord_report_pages "
-            "ORDER BY created_at DESC LIMIT ?)",
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?)",
             (int(max_rows),),
         )
 
