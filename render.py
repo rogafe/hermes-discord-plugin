@@ -49,19 +49,30 @@ def footer_text(model: Optional[str], template: Optional[str] = None) -> str:
     return text[:EMBED_FOOTER_LIMIT]
 
 
-def build_embed_dict(description: str, *, color: int, footer: str = "") -> dict:
-    """One embed carrying *description*; footer only when non-empty."""
+def build_embed_dict(
+    description: str, *, color: int, footer: str = "", title: str = "",
+) -> dict:
+    """Build a reply embed, optionally labelling a page in a multipart response."""
     embed: dict = {"type": "rich", "description": description[:EMBED_DESCRIPTION_LIMIT], "color": color}
+    if title:
+        embed["title"] = title[:256]
     if footer:
         embed["footer"] = {"text": footer}
+    # Discord enforces both a per-field cap and a 6000-character aggregate cap.
+    # Keep the builder valid even when callers provide unusually long custom footers.
+    available = max(
+        0,
+        EMBED_TOTAL_LIMIT - len(embed.get("title", "")) - len(embed.get("footer", {}).get("text", "")),
+    )
+    embed["description"] = embed["description"][:available]
     return embed
 
 
 def build_offer_embed_dict(
-    title: str, body: str, *, color: int, number: int, footer: str = "",
+    title: str, body: str, *, color: int, number: int, footer: str = "", job_id: str = "",
 ) -> dict:
     """Build a compact job-offer card from one numbered Cronjob Response block."""
-    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    lines = body.splitlines()
     location = deadline = targeting = ""
     for index, line in enumerate(lines):
         match = re.search(r"📍\s*(.*?)\s*\|\s*📅\s*(.*?)\s*\|\s*🎯\s*(.*)", line)
@@ -70,8 +81,8 @@ def build_offer_embed_dict(
             del lines[index]
             break
 
-    url = next((line.strip("<> ") for line in lines if re.match(r"https?://\S+", line)), "")
-    lines = [line for line in lines if not re.match(r"https?://\S+", line)]
+    url = next((line.strip().strip("<> ") for line in lines if re.match(r"https?://\S+", line.strip())), "")
+    lines = [line for line in lines if not re.match(r"https?://\S+", line.strip())]
     description = "\n".join(lines).strip()
     embed: dict = {
         "type": "rich",
@@ -87,7 +98,12 @@ def build_offer_embed_dict(
             fields.append({"name": name, "value": value[:1024], "inline": name != "🎯 Ciblage"})
     if fields:
         embed["fields"] = fields
-    card_footer = (f"Offre {number}" + (f" · {footer}" if footer else ""))[:EMBED_FOOTER_LIMIT]
+    card_footer = f"Offre {number}"
+    if job_id:
+        card_footer += f" · job_id: {job_id}"
+    if footer:
+        card_footer += f" · {footer}"
+    card_footer = card_footer[:EMBED_FOOTER_LIMIT]
     field_chars = sum(len(field["name"]) + len(field["value"]) for field in fields)
     available_description = max(
         0,

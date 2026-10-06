@@ -66,14 +66,22 @@ numbered offer headings (`**[N] Title**`), sends the report introduction, each o
 as separate messages through the original adapter, then edits each into an embed. Offer button clicks are
 authorized with Hermes' Discord component allowlist/pairing check and become normal text events in that
 channel or thread. Button custom IDs carry only the job ID, offer number, and action; no offer text is sent
-back in the interaction payload.
+back in the interaction payload. An offer too long for one interactive card stays readable as a regular
+report segment; the remaining offers keep their buttons.
+
+Multi-message replies receive `Partie 1/N` / `Suite · partie N/N` titles. Cron report fragments retain blank
+lines, indentation, and fenced code blocks, and Markdown headings are converted to bold because Discord
+embeds do not render `#` headings. The visible `⏎` line-break marker found in some cron output is normalized
+to a real newline.
 
 Any failure leaves the plain-text reply as it was.
 
 ### Known limitations
 
 - The reply appears as plain text for a moment before becoming an embed (one extra edit per message).
-- Long replies keep Hermes' 2000-character chunking: one embed per chunk, footer on the last.
+- Long ordinary replies still use Hermes' own 2000-character chunking. The plugin labels each resulting
+  embed as a continuation but cannot change where Hermes split the source text, so a boundary may still
+  fall inside a sentence or Markdown construct.
 - Replies in **forum** channels (which create a new post) stay plain text.
 - Interactive offer cards require a current Hermes Discord adapter exposing `handle_message` and `build_source`,
   plus its component authorization helper. If that inbound seam is unavailable, the plugin leaves the buttons
