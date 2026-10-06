@@ -129,6 +129,51 @@ class OfferStateStore:
                 logger.warning("hermes-discord-plugin: could not write offer note", exc_info=True)
                 return False
 
+    def pending_cards(self, channel_id: str) -> list[tuple[str, str, int, bool]]:
+        """Unclaimed registered cards for one channel: ``(message_id, job_id, number, has_note)``.
+
+        The plugin slash command (``/cron-pending``) reads this so users can recover offer numbers
+        when a card was deleted or the gateway restarted. At most 51 recent rows; row 51 signals
+        that the displayed list is capped at 50.
+        """
+        with _DATABASE_LOCK:
+            try:
+                connection = self._connection()
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not read pending offer cards", exc_info=True)
+                return []
+            if connection is None:
+                result = []
+                for message_id, (card_channel, job_id, number) in reversed(list(self._memory_cards.items())):
+                    if card_channel != str(channel_id) or not job_id:
+                        continue
+                    key = (message_id, job_id, number)
+                    if key in self._memory_claims:
+                        continue
+                    result.append((message_id, job_id, number, key in self._memory_notes))
+                return result[:51]
+            try:
+                self._ensure_schema(connection)
+                rows = connection.execute(
+                    "SELECT c.message_id, c.job_id, c.offer_number, (n.message_id IS NOT NULL) "
+                    "FROM hermes_discord_offer_cards c "
+                    "LEFT JOIN hermes_discord_offer_actions a ON "
+                    "a.message_id = c.message_id AND a.job_id = c.job_id "
+                    "AND a.offer_number = c.offer_number "
+                    "LEFT JOIN hermes_discord_offer_notes n ON "
+                    "n.message_id = c.message_id AND n.job_id = c.job_id "
+                    "AND n.offer_number = c.offer_number "
+                    "WHERE c.channel_id = ? AND a.message_id IS NULL "
+                    "ORDER BY c.created_at DESC LIMIT 51",
+                    (str(channel_id),),
+                ).fetchall()
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not query pending offer cards", exc_info=True)
+                return []
+            # Cards are keyed by message; a note reservation alone does not consume the action slot,
+            # so a card with a note but no action still counts as pending (annotated 🗒️).
+            return [(str(r[0]), str(r[1]), int(r[2]), bool(r[3])) for r in rows]
+
     def remove_note(self, message_id: str, job_id: str, offer_number: int) -> None:
         """Release the note slot after a failed injection so the user can retry."""
         key = (str(message_id), str(job_id), int(offer_number))

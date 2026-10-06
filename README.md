@@ -47,11 +47,30 @@ plugins:
         cron_offer_interactions: true   # split numbered Cronjob Response offers into interactive cards
         cron_offer_buttons: true        # route button choices back into Hermes
         cron_offer_notes: true          # add a Remarque button/modal to collect a note per offer card
+        cron_pending_command: true      # register /cron-pending (list unclaimed offer cards); restart to apply
         cron_report_pagination: true    # large cron reports become page embeds instead of dozens of cards
         cron_report_pagination_threshold: 8  # offers needed before pagination kicks in (0 = never paginate)
 ```
 
 Leave Hermes' own text footer (`display.runtime_footer`) off, or its line will show up inside the embed too.
+
+## Slash command
+
+The plugin registers one Hermes plugin command, **`/cron-pending`** (toggle: `cron_pending_command`,
+needs a gateway restart to register or unregister). It runs entirely through Hermes' plugin-command
+seam — `ctx.register_command(name, handler, description)` — so:
+
+- Registration into Discord's slash picker is done by Hermes' Discord adapter itself; the plugin never
+  touches the command tree, sync, rate limits or the 100-command cap.
+- Dispatch is Hermes': its slash-authorization gates, drain gate and `raw_args: str` handler contract.
+- The reply is plain text in the calling conversation (it may render as an embed if
+  `embed_non_model_replies` is on).
+
+It lists the cron offer cards in the current conversation that have **no action yet** (offer number,
+job id, pending-note flag), reading the durable `plugin_db` card registry — useful after a card is
+deleted, a gateway restart, or when you just want the numbers again. Commands are registered globally
+by Hermes (no per-guild sync seam) and, like all plugin commands, are dropped first if Hermes hits
+Discord's 100-command cap.
 
 ## How it works
 
