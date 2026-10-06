@@ -12,6 +12,23 @@ model that answered in the embed footer:
 Tool progress, typing indicators, approval prompts and other intermediate messages are left alone; only the
 final reply of each turn is converted.
 
+To keep tool activity out of Discord while retaining it in Hermes' log, configure the gateway's display
+settings (these are Hermes settings, not plugin settings) in the profile's `config.yaml`:
+
+```yaml
+display:
+  platforms:
+    discord:
+      tool_progress: log
+      interim_assistant_messages: false
+      show_reasoning: false
+      busy_ack_detail: false
+      long_running_notifications: false
+```
+
+`tool_progress: log` writes tool-call details to `~/.hermes/logs/tool_calls.log` instead of posting them
+in Discord. Restart the gateway after changing these settings. The available keys depend on the Hermes version.
+
 Numbered offers in a final `Cronjob Response` are sent as separate embed cards. Each card shows the offer
 title, location, deadline, targeting, and application link, with **Ignorer**, **Suivre**, and **Postuler**
 buttons. Clicking one submits the equivalent `N 🗑️`, `N 👀`, or `N 📝` choice to the current Hermes Discord
