@@ -44,3 +44,23 @@ config_schema:
     default: true
     label: "Cron offer action buttons"
     description: "Add buttons that send the selected offer action back to the current Hermes Discord conversation."
+  cron_offer_notes:
+    type: bool
+    default: true
+    label: "Cron offer note modal"
+    description: "Add a Remarque button to each offer card that opens a modal and forwards the typed note to Hermes alongside the offer."
+  cron_pending_command:
+    type: bool
+    default: true
+    label: "Cron pending slash command"
+    description: "Register the /cron-pending slash command, which lists unclaimed offer cards in the current conversation. Registration happens once, so toggling needs a gateway restart."
+  cron_report_pagination:
+    type: bool
+    default: true
+    label: "Paginate large cron reports"
+    description: "Deliver big Cronjob Responses as page embeds with Previous/Next buttons instead of dozens of offer cards."
+  cron_report_pagination_threshold:
+    type: int
+    default: 8
+    label: "Pagination threshold (offers)"
+    description: "Number of offers from which a cron report is paginated. 0 disables pagination."
