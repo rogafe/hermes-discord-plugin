@@ -16,7 +16,12 @@ from .parser import is_fence_boundary
 
 # A higher-priority boundary smaller than this fraction of the limit loses to a lower-priority one.
 MIN_FILL_RATIO = 4
-_SENTENCE_END = ".!?…。！？"
+# Grapheme glue, spelled by Unicode name so no invisible character appears in the source.
+ZWJ = "\N{ZERO WIDTH JOINER}"
+_JOINING_MARKS = ZWJ + "\N{VARIATION SELECTOR-16}\N{VARIATION SELECTOR-15}\N{COMBINING ENCLOSING KEYCAP}"
+_SKIN_TONE_FIRST, _SKIN_TONE_LAST = "\N{EMOJI MODIFIER FITZPATRICK TYPE-1-2}", "\N{EMOJI MODIFIER FITZPATRICK TYPE-6}"
+_FLAG_FIRST, _FLAG_LAST = "\N{REGIONAL INDICATOR SYMBOL LETTER A}", "\N{REGIONAL INDICATOR SYMBOL LETTER Z}"
+_SENTENCE_END = ".!?\N{HORIZONTAL ELLIPSIS}\N{IDEOGRAPHIC FULL STOP}\N{FULLWIDTH EXCLAMATION MARK}\N{FULLWIDTH QUESTION MARK}"
 # Inline spans that must not be cut. Matched per paragraph (no blank line inside), outside fences.
 _INLINE_SPANS = [
     re.compile(r"!?\[[^\]\n]+\]\((?:[^()\s]|\([^()\s]*\))*(?:\s+\"[^\"\n]*\")?\)"),
@@ -197,9 +202,9 @@ def _glues(text: str, position: int) -> bool:
         return False
     after, before = text[position], text[position - 1]
     return (
-        before == "‍"
-        or after in "‍️︎⃣"
-        or "\U0001f3fb" <= after <= "\U0001f3ff"
+        before == ZWJ
+        or after in _JOINING_MARKS
+        or _SKIN_TONE_FIRST <= after <= _SKIN_TONE_LAST
         or unicodedata.category(after).startswith("M")
-        or ("\U0001f1e6" <= before <= "\U0001f1ff" and "\U0001f1e6" <= after <= "\U0001f1ff")
+        or (_FLAG_FIRST <= before <= _FLAG_LAST and _FLAG_FIRST <= after <= _FLAG_LAST)
     )

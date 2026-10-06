@@ -130,12 +130,16 @@ def test_fence_inner_syntax_is_not_markdown(chunking):
 
 
 def test_unicode_and_emoji_survive(chunking):
-    text = "héllo wörld 日本語のテキスト。" * 30 + "👨‍👩‍👧‍👦" * 20 + "👍🏽" * 20 + "🇫🇷" * 10
+    ZWJ = chunking.ZWJ
+    family = ZWJ.join(["\N{MAN}", "\N{WOMAN}", "\N{GIRL}", "\N{BOY}"])
+    thumbs = "\N{THUMBS UP SIGN}\N{EMOJI MODIFIER FITZPATRICK TYPE-4}"
+    flag = "\N{REGIONAL INDICATOR SYMBOL LETTER F}\N{REGIONAL INDICATOR SYMBOL LETTER R}"
+    text = "héllo wörld 日本語のテキスト。" * 30 + family * 20 + thumbs * 20 + flag * 10
     chunks = _check(chunking, text, 17)
     joined = "".join(chunks)
     assert joined == text
-    assert all(not c.startswith(("‍", "️", "\U0001f3fd")) for c in chunks)
-    assert all(not c.endswith("‍") for c in chunks)
+    assert all(not c.startswith((ZWJ, "\N{VARIATION SELECTOR-16}", "\N{EMOJI MODIFIER FITZPATRICK TYPE-4}")) for c in chunks)
+    assert all(not c.endswith(ZWJ) for c in chunks)
 
 
 @pytest.mark.parametrize("limit", [7, 20, 64, 200, 2000])
