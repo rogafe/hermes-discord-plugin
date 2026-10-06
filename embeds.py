@@ -4,36 +4,22 @@ from __future__ import annotations
 import logging
 import re
 import inspect
-import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
+from .message_model import MessageDocument, Offer, Segment
+from .interaction_router import InteractionRouter
 from .models import ModelTracker
-from .render import build_embed_dict, build_offer_embed_dict, footer_text, parse_color
+from .page_store import PageStore
+from .parser import is_fence_boundary, parse_message
+from .pagination import build_report_pages, custom_id as pager_custom_id, should_paginate
+from .render import build_embed_dict, build_offer_embed_dict, build_report_embed_dict, footer_text, parse_color
+from .state_store import OfferStateStore
 
 logger = logging.getLogger(__name__)
 
 _STATE_ATTR = "_hermes_discord_embeds"
-_CRON_HEADER = re.compile(r"^\s*Cronjob Response:.*?\bjob_id:\s*([A-Za-z0-9_-]+)", re.I | re.S)
-_OFFER_HEADING = re.compile(r"^\s*\*\*\[(\d+)\]\s*(.*?)\*\*\s*(?:🆕)?\s*$")
-_ACTION_LINE = re.compile(r"^\s*(?:🗑️|👀|📝)\s*(?:Ignore|Ignorer|Follow|Suivre|Va postuler).*$", re.I)
-
 GetSetting = Callable[[str, Any], Any]
-
-
-@dataclass
-class _Offer:
-    number: int
-    title: str
-    body: str
-    job_id: str
-
-
-@dataclass
-class _Segment:
-    text: str
-    offer: Optional[_Offer] = None
 
 
 class _AdapterState:
@@ -45,8 +31,12 @@ class _AdapterState:
         self.tracker = tracker
         self.get_setting = get_setting
         self.listener_bots: set[int] = set()
-        self.claimed_clicks: set[tuple[str, str]] = set()
-        self.click_lock = threading.Lock()
+        self.interaction_router = InteractionRouter()
+        self.interaction_router.register("hermes_offer|", _handle_offer_button)
+        self.interaction_router.register("hermes_note_modal|", _handle_note_modal)
+        self.interaction_router.register("hermes_pager|", _handle_pager_button)
+        self.offer_store = OfferStateStore()
+        self.page_store = PageStore()
 
 
 def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSetting) -> None:
@@ -66,15 +56,18 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
     original_edit = adapter.edit_message
 
     async def send(chat_id, content, reply_to=None, metadata=None):
+        if isinstance(content, str) and bool(metadata and metadata.get("notify")):
+            content = _normalize_cron_linebreak_markers(content)
         if (
-            bool(metadata and metadata.get("notify"))
+            isinstance(content, str)
+            and bool(metadata and metadata.get("notify"))
             and _setting_bool(get_setting, "enabled", True)
             and _setting_bool(get_setting, "cron_offer_interactions", True)
         ):
-            job_id, segments = _parse_cron_offers(content)
-            if job_id and segments:
+            document = parse_message(content)
+            if document.source_format == "cron_offer_report" and document.segments:
                 return await _send_cron_offer_segments(
-                    state, original_send, chat_id, segments, reply_to, metadata,
+                    state, original_send, chat_id, document, reply_to, metadata,
                 )
 
         result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
@@ -100,15 +93,32 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
 
 
 async def _send_cron_offer_segments(
-    state: _AdapterState, original_send: Callable, chat_id: Any, segments: list[_Segment],
+    state: _AdapterState, original_send: Callable, chat_id: Any, document: MessageDocument,
     reply_to: Any, metadata: Optional[dict],
 ) -> Any:
-    """Send report context and each offer separately, preserving the adapter's send path."""
+    """Send reports as clean pagers or per-offer cards, preserving the adapter's send path."""
     tracker = state.tracker
     model_keys = _route_keys(chat_id, metadata)
     # Consume once for the whole logical response so the model footer cannot leak to a later turn.
     model = tracker.take(model_keys)
-    sent: list[tuple[_Segment, list[str]]] = []
+    pg_threshold = _setting_int(state.get_setting, "cron_report_pagination_threshold", 8)
+    pg_enabled = pg_threshold > 0 and _setting_bool(
+        state.get_setting, "cron_report_pagination", True,
+    ) and _interaction_route_ready(state.adapter)
+    if pg_enabled and should_paginate(document, pg_threshold):
+        pages = build_report_pages(document)
+        if pages is not None:
+            paginated_result = await _send_paginated_report(
+                state, original_send, chat_id, document, pages, reply_to, metadata, model,
+            )
+            if paginated_result is not None:
+                return paginated_result
+            logger.warning("hermes-discord-plugin: pager channel unavailable; falling back to offer cards")
+        logger.info(
+            "hermes-discord-plugin: pagination skipped (report does not split within embed limits)"
+        )
+    segments = document.segments
+    sent: list[tuple[Segment, list[str]]] = []
     result = None
     for index, segment in enumerate(segments):
         result = await original_send(
@@ -139,9 +149,175 @@ async def _send_cron_offer_segments(
     return result
 
 
+async def _send_paginated_report(
+    state: _AdapterState, original_send: Callable, chat_id: Any, document: MessageDocument,
+    pages: list[str], reply_to: Any, metadata: Optional[dict], model: Optional[str],
+) -> Any:
+    """Deliver one large cron report as page embeds with persistent Previous/Next buttons.
+
+    All pages except the last are sent first; the final page carries the model
+    footer, mirroring the plain multi-message flow.
+    """
+    import discord
+
+    keys = _route_keys(chat_id, metadata)
+    channel = await _resolve_channel(state.bot, keys)
+    if channel is None or isinstance(channel, discord.ForumChannel):
+        return None
+    message_ids: list[str] = []
+    result = None
+    for index, page in enumerate(pages):
+        result = await original_send(
+            chat_id, page, reply_to=reply_to if index == 0 else None, metadata=metadata,
+        )
+        if not getattr(result, "success", False):
+            logger.warning("hermes-discord-plugin: paginated report delivery failed")
+            return result
+        message_ids.extend(_sent_message_ids(result))
+    try:
+        await _decorate_paginated_report(
+            state, chat_id, metadata, message_ids, pages, document.job_id or "", model,
+        )
+    except Exception as exc:
+        logger.warning("hermes-discord-plugin: report pager rendering failed: %s", exc)
+    if result is not None and message_ids:
+        # Keep the adapter's logical-send contract: message_id is the first response and
+        # raw_response carries every delivered Discord message.
+        try:
+            result.message_id = message_ids[0]
+            raw = getattr(result, "raw_response", None)
+            if isinstance(raw, dict):
+                raw["message_ids"] = message_ids
+            else:
+                result.raw_response = {"message_ids": message_ids}
+        except Exception:
+            logger.warning("hermes-discord-plugin: adapter send result could not be aggregated")
+    return result
+
+
+async def _decorate_paginated_report(
+    state: _AdapterState, chat_id: Any, metadata: Optional[dict],
+    message_ids: list[str], pages: list[str], job_id: str, model: Optional[str],
+) -> None:
+    import discord
+
+    if not _setting_bool(state.get_setting, "enabled", True):
+        return
+    keys = _route_keys(chat_id, metadata)
+    channel = await _resolve_channel(state.bot, keys)
+    if channel is None or isinstance(channel, discord.ForumChannel):
+        return
+    footer = footer_text(model, state.get_setting("footer_template", None)) if model else ""
+    color = parse_color(state.get_setting("color", None))
+    total = len(pages)
+    for index, (page, message_id) in enumerate(zip(pages, message_ids)):
+        message = await _resolve_message(state.bot, channel, message_id)
+        if message is None or not message.content or message.embeds:
+            continue
+        embed_data = build_report_embed_dict(
+            _normalize_embed_markdown(page), color=color,
+            index=index, total=total, job_id=job_id,
+            footer=footer if index == total - 1 else "",
+        )
+        view = None
+        if _setting_bool(state.get_setting, "cron_report_pagination", True):
+            stored = state.page_store.save(message_id, str(channel.id), job_id, pages, footer)
+            if stored:
+                view = _pager_view(job_id, index, total)
+            else:
+                logger.warning("hermes-discord-plugin: report pager omitted on %s", message_id)
+        try:
+            await message.edit(content=None, embed=discord.Embed.from_dict(embed_data), view=view)
+        except Exception as exc:
+            logger.warning("hermes-discord-plugin: could not render report page %s: %s", message_id, exc)
+
+
+def _pager_view(job_id: str, index: int, total: int):
+    import discord
+
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        emoji="◀️", style=discord.ButtonStyle.secondary, disabled=index <= 0,
+        custom_id=pager_custom_id(job_id, max(0, index - 1)),
+    ))
+    view.add_item(discord.ui.Button(
+        label=f"{index + 1}/{total}", style=discord.ButtonStyle.secondary, disabled=True,
+        custom_id=pager_custom_id(job_id, index),
+    ))
+    view.add_item(discord.ui.Button(
+        emoji="▶️", style=discord.ButtonStyle.secondary, disabled=index >= total - 1,
+        custom_id=pager_custom_id(job_id, min(total - 1, index + 1)),
+    ))
+    return view
+
+
+async def _handle_pager_button(interaction: Any) -> None:
+    """Re-render the stored page matching the clicked direction; acknowledge inline."""
+    import discord
+
+    custom_id_value = (getattr(interaction, "data", None) or {}).get("custom_id", "")
+    match = re.fullmatch(r"hermes_pager\|([A-Za-z0-9_-]{1,72})\|(\d{1,3})", custom_id_value)
+    if not match:
+        await _respond_ephemeral(interaction, "Ce bouton de page n’est plus valide.")
+        return
+    job_id, page_index = match.group(1), int(match.group(2))
+    state = _find_state_for_interaction(interaction)
+    if state is None:
+        await _respond_ephemeral(interaction, "Cette action n’est plus disponible.")
+        return
+    if not (
+        _setting_bool(state.get_setting, "enabled", True)
+        and _setting_bool(state.get_setting, "cron_report_pagination", True)
+    ):
+        await _respond_ephemeral(interaction, "La pagination des rapports est désactivée.")
+        return
+    if not await _authorized_component(state.adapter, interaction):
+        await _respond_ephemeral(interaction, "Tu n’es pas autorisé à utiliser ces boutons.")
+        return
+
+    message = getattr(interaction, "message", None)
+    channel = getattr(interaction, "channel", None)
+    if message is None or channel is None:
+        await _respond_ephemeral(interaction, "Cette pagination n’est plus disponible.")
+        return
+    loaded = state.page_store.load(str(getattr(message, "id", "")), str(channel.id), job_id)
+    if not loaded:
+        await _respond_ephemeral(interaction, "Cette pagination n’est plus disponible.")
+        return
+    pages, footer = loaded
+    total = len(pages)
+    if not 0 <= page_index < total:
+        await _respond_ephemeral(interaction, "Cette page n’existe plus.")
+        return
+    try:
+        embed = discord.Embed.from_dict(build_report_embed_dict(
+            _normalize_embed_markdown(pages[page_index]),
+            color=parse_color(state.get_setting("color", None)),
+            index=page_index, total=total, job_id=job_id,
+            # The model footer stays on the final page of the report, like the plain flow.
+            footer=footer if page_index == total - 1 else "",
+        ))
+        await interaction.response.edit_message(
+            content=None,
+            embed=embed,
+            view=_pager_view(job_id, page_index, total),
+        )
+    except Exception:
+        logger.exception("hermes-discord-plugin: could not switch report page")
+        try:
+            if getattr(interaction.response, "is_done", lambda: False)():
+                await interaction.followup.send("Le changement de page a échoué.", ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    "Le changement de page a échoué.", ephemeral=True,
+                )
+        except Exception:
+            pass
+
+
 async def _decorate_cron_segments(
     state: _AdapterState, chat_id: Any, metadata: Optional[dict],
-    sent: list[tuple[_Segment, list[str]]], model: Optional[str],
+    sent: list[tuple[Segment, list[str]]], model: Optional[str],
 ) -> None:
     import discord
 
@@ -153,9 +329,16 @@ async def _decorate_cron_segments(
         return
     all_ids = [(segment, message_id) for segment, ids in sent for message_id in ids]
     last_id = all_ids[-1][1] if all_ids else None
+    report_total = sum(1 for segment, _message_id in all_ids if segment.offer is None)
+    report_part = 0
     footer = footer_text(model, state.get_setting("footer_template", None)) if model else ""
     color = parse_color(state.get_setting("color", None))
     buttons_enabled = _setting_bool(state.get_setting, "cron_offer_buttons", True)
+    interaction_ready = _interaction_route_ready(state.adapter)
+    if buttons_enabled and not interaction_ready and any(segment.offer for segment, _id in all_ids):
+        logger.warning(
+            "hermes-discord-plugin: cron offer buttons omitted: inbound Discord interaction route unavailable"
+        )
 
     for segment, message_id in all_ids:
         message = await _resolve_message(state.bot, channel, message_id)
@@ -165,23 +348,36 @@ async def _decorate_cron_segments(
         message_footer = footer if is_last else ""
         if segment.offer:
             embed_data = build_offer_embed_dict(
-                segment.offer.title, segment.offer.body, color=color,
-                number=segment.offer.number, footer=message_footer,
+                segment.offer.title, _normalize_embed_markdown(segment.offer.body), color=color,
+                number=segment.offer.number, footer=message_footer, job_id=segment.offer.job_id,
             )
-            view = _offer_view(segment.offer) if buttons_enabled and _interaction_route_ready(state.adapter) else None
+            stored = state.offer_store.register_card(
+                str(message.id), str(channel.id), segment.offer.job_id, segment.offer.number,
+            ) if buttons_enabled and interaction_ready else False
+            view = _offer_view(segment.offer, with_note=_setting_bool(
+                state.get_setting, "cron_offer_notes", True,
+            )) if buttons_enabled and interaction_ready and stored else None
+            if buttons_enabled and interaction_ready and not stored:
+                logger.warning("hermes-discord-plugin: cron offer buttons omitted: card identity could not be stored")
             try:
                 await message.edit(content=None, embed=discord.Embed.from_dict(embed_data), view=view)
             except Exception as exc:
                 logger.warning("hermes-discord-plugin: could not render offer card %s: %s", message_id, exc)
         else:
-            embed_data = build_embed_dict(message.content, color=color, footer=message_footer)
+            report_part += 1
+            embed_data = build_embed_dict(
+                _normalize_embed_markdown(message.content),
+                color=color,
+                footer=message_footer,
+                title=f"Rapport · partie {report_part}/{report_total}" if report_total > 1 else "Rapport",
+            )
             try:
                 await message.edit(content=None, embed=discord.Embed.from_dict(embed_data))
             except Exception as exc:
                 logger.warning("hermes-discord-plugin: could not render report message %s: %s", message_id, exc)
 
 
-def _offer_view(offer: _Offer):
+def _offer_view(offer: Offer, *, with_note: bool = True):
     import discord
 
     if len(offer.job_id) > 72:
@@ -201,6 +397,13 @@ def _offer_view(offer: _Offer):
         # when discord.py no longer has this transient View instance in its view store.
         button.callback = _ignore_view_callback
         view.add_item(button)
+    if with_note:
+        note_button = discord.ui.Button(
+            label="Remarque", emoji="🗒️", style=discord.ButtonStyle.secondary,
+            custom_id=f"hermes_offer|{offer.job_id}|{offer.number}|note",
+        )
+        note_button.callback = _ignore_view_callback
+        view.add_item(note_button)
     return view
 
 
@@ -211,46 +414,51 @@ async def _ignore_view_callback(_interaction: Any) -> None:
 async def _handle_offer_button(interaction: Any) -> None:
     """Authenticate the click, acknowledge it, then inject the choice as a Hermes user event."""
     custom_id = (getattr(interaction, "data", None) or {}).get("custom_id", "")
-    match = re.fullmatch(r"hermes_offer\|([A-Za-z0-9_-]{1,72})\|(\d{1,3})\|(ignore|follow|apply)", custom_id)
+    match = re.fullmatch(r"hermes_offer\|([A-Za-z0-9_-]{1,72})\|(\d{1,3})\|(ignore|follow|apply|note)", custom_id)
     if not match:
+        await _respond_ephemeral(interaction, "Ce bouton d’offre n’est plus valide.")
         return
     job_id, number, action = match.groups()
     state = _find_state_for_interaction(interaction)
     if state is None:
-        await interaction.response.send_message("Cette action n’est plus disponible.", ephemeral=True)
+        await _respond_ephemeral(interaction, "Cette action n’est plus disponible.")
         return
     if not (
         _setting_bool(state.get_setting, "enabled", True)
         and _setting_bool(state.get_setting, "cron_offer_interactions", True)
         and _setting_bool(state.get_setting, "cron_offer_buttons", True)
     ):
-        await interaction.response.send_message("Les actions des offres sont désactivées.", ephemeral=True)
+        await _respond_ephemeral(interaction, "Les actions des offres sont désactivées.")
         return
     if not await _authorized_component(state.adapter, interaction):
-        await interaction.response.send_message("Tu n’es pas autorisé à utiliser ces boutons.", ephemeral=True)
+        await _respond_ephemeral(interaction, "Tu n’es pas autorisé à utiliser ces boutons.")
         return
 
     message = getattr(interaction, "message", None)
-    if not _interaction_matches_card(message, number):
-        await interaction.response.send_message("Ce bouton ne correspond plus à une carte d’offre valide.", ephemeral=True)
+    if not _interaction_matches_card(state, interaction, message, number, job_id):
+        await _respond_ephemeral(interaction, "Ce bouton ne correspond plus à une carte d’offre valide.")
         return
-    claim_key = (str(getattr(message, "id", "")), job_id)
-    with state.click_lock:
-        already_claimed = claim_key in state.claimed_clicks
-        if not already_claimed:
-            state.claimed_clicks.add(claim_key)
-    if already_claimed:
-        await interaction.response.send_message("Une action a déjà été envoyée pour cette carte.", ephemeral=True)
+    if action == "note":
+        await _open_note_modal(state, interaction, job_id, number)
         return
-
-    await interaction.response.defer(ephemeral=True)
     emoji, label = {
         "ignore": ("🗑️", "Ignorer"),
         "follow": ("👀", "Suivre"),
         "apply": ("📝", "Postuler"),
     }[action]
+    message_id = str(getattr(message, "id", ""))
+    interaction_id = str(getattr(interaction, "id", ""))
+    user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+    if not state.offer_store.claim(message_id, job_id, int(number), interaction_id, action, user_id):
+        await _respond_ephemeral(interaction, "Une action a déjà été envoyée pour cette carte.")
+        return
+
+    committed = False
     try:
+        await interaction.response.defer(ephemeral=True)
         await _inject_choice(state.adapter, interaction, f"{number} {emoji} (job_id: {job_id})")
+        committed = True
+        state.offer_store.commit_claim(message_id, job_id, int(number), interaction_id)
         if getattr(interaction, "message", None) is not None:
             try:
                 await interaction.message.edit(view=None)
@@ -258,10 +466,148 @@ async def _handle_offer_button(interaction: Any) -> None:
                 pass
         await interaction.followup.send(f"Choix transmis à Hermes : offre {number} — {label}.", ephemeral=True)
     except Exception as exc:
-        with state.click_lock:
-            state.claimed_clicks.discard(claim_key)
+        if not committed:
+            state.offer_store.release_claim(message_id, job_id, int(number), interaction_id)
         logger.warning("hermes-discord-plugin: could not route cron offer interaction: %s", exc)
-        await interaction.followup.send("Le clic n’a pas pu être transmis à Hermes.", ephemeral=True)
+        try:
+            if getattr(interaction.response, "is_done", lambda: False)():
+                await interaction.followup.send("Le clic n’a pas pu être transmis à Hermes.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Le clic n’a pas pu être transmis à Hermes.", ephemeral=True)
+        except Exception:
+            pass
+
+
+async def _open_note_modal(state: _AdapterState, interaction: Any, job_id: str, number: str) -> None:
+    """Open the Remarque modal as the *initial* response: authorization and card identity
+    are checked first because a modal cannot be preceded by a defer/acknowledgement."""
+    import discord
+
+    if not (
+        _setting_bool(state.get_setting, "enabled", True)
+        and _setting_bool(state.get_setting, "cron_offer_interactions", True)
+        and _setting_bool(state.get_setting, "cron_offer_buttons", True)
+        and _setting_bool(state.get_setting, "cron_offer_notes", True)
+    ):
+        await _respond_ephemeral(interaction, "Les remarques sur les offres sont désactivées.")
+        return
+    # No claim yet: a note must never consume the single ignore/follow/apply slot.
+    # The one-note-per-card dedupe happens at modal-submit time (see _handle_note_modal).
+    modal = discord.ui.Modal(
+        title=f"Remarque · offre {number}",
+        custom_id=f"hermes_note_modal|{job_id}|{number}",
+    )
+    modal.add_item(discord.ui.TextInput(
+        label="Note à transmettre à Hermes",
+        style=discord.TextStyle.paragraph,
+        custom_id="note_text",
+        required=True,
+        max_length=1000,
+    ))
+    try:
+        await interaction.response.send_modal(modal)
+    except Exception:
+        logger.warning("hermes-discord-plugin: could not open offer note modal", exc_info=True)
+        # send_modal failed before any acknowledgement, so a plain ephemeral reply is still allowed.
+        await _respond_ephemeral(interaction, "La fenêtre de remarque n’a pas pu être ouverte.")
+
+
+async def _handle_note_modal(interaction: Any) -> None:
+    """Authenticate the modal submit, re-validate it against the persistent card
+    identity, deduplicate, then inject the note alongside the offer into Hermes."""
+    custom_id = (getattr(interaction, "data", None) or {}).get("custom_id", "")
+    match = re.fullmatch(r"hermes_note_modal\|([A-Za-z0-9_-]{1,72})\|(\d{1,3})", custom_id)
+    if not match:
+        await _respond_ephemeral(interaction, "Ce formulaire n’est plus valide.")
+        return
+    job_id, number = match.groups()
+    note_text = _modal_text_value(interaction, "note_text")
+    if not note_text:
+        await _respond_ephemeral(interaction, "La remarque est vide.")
+        return
+    state = _find_state_for_interaction(interaction)
+    if state is None:
+        await _respond_ephemeral(interaction, "Cette action n’est plus disponible.")
+        return
+    if not (
+        _setting_bool(state.get_setting, "enabled", True)
+        and _setting_bool(state.get_setting, "cron_offer_interactions", True)
+        and _setting_bool(state.get_setting, "cron_offer_buttons", True)
+        and _setting_bool(state.get_setting, "cron_offer_notes", True)
+    ):
+        await _respond_ephemeral(interaction, "Les remarques sur les offres sont désactivées.")
+        return
+    if not await _authorized_component(state.adapter, interaction):
+        await _respond_ephemeral(interaction, "Tu n’es pas autorisé à utiliser ce formulaire.")
+        return
+
+    message = getattr(interaction, "message", None)
+    if not _interaction_matches_card(state, interaction, message, number, job_id):
+        await _respond_ephemeral(interaction, "Ce formulaire ne correspond plus à une carte d’offre valide.")
+        return
+    message_id = str(getattr(message, "id", ""))
+    user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+    if not state.offer_store.save_note(message_id, job_id, int(number), user_id):
+        await _respond_ephemeral(interaction, "Une remarque a déjà été envoyée pour cette carte.")
+        return
+
+    committed = False
+    try:
+        await interaction.response.defer(ephemeral=True)
+        await _inject_choice(
+            state.adapter, interaction,
+            f"{number} 🗒️ Remarque (job_id: {job_id}) : {note_text}",
+        )
+        committed = True
+        await interaction.followup.send(
+            f"Remarque transmise à Hermes pour l’offre {number}.", ephemeral=True,
+        )
+    except Exception as exc:
+        if not committed:
+            state.offer_store.remove_note(message_id, job_id, int(number))
+        logger.warning("hermes-discord-plugin: could not route offer note: %s", exc)
+        try:
+            if getattr(interaction.response, "is_done", lambda: False)():
+                await interaction.followup.send("La remarque n’a pas pu être transmise à Hermes.", ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    "La remarque n’a pas pu être transmise à Hermes.", ephemeral=True,
+                )
+        except Exception:
+            pass
+
+
+def _modal_text_value(interaction: Any, component_custom_id: str) -> str:
+    """Extract a text-input value from a MODAL_SUBMIT payload across discord.py shapes."""
+    components = (getattr(interaction, "data", None) or {}).get("components") or []
+    for row in components:
+        fields = (
+            getattr(row, "children", None)
+            or getattr(row, "components", None)
+            or (row if isinstance(row, list) else [])
+        )
+        for field in fields:
+            if getattr(field, "custom_id", None) == component_custom_id:
+                text = str(getattr(field, "value", "") or "").strip()
+                if text:
+                    return text
+            if isinstance(field, dict):
+                if field.get("custom_id") == component_custom_id:
+                    text = str(field.get("value", "") or "").strip()
+                    if text:
+                        return text
+    return ""
+
+
+async def _respond_ephemeral(interaction: Any, content: str) -> None:
+    try:
+        response = interaction.response
+        if getattr(response, "is_done", lambda: False)():
+            await interaction.followup.send(content, ephemeral=True)
+        else:
+            await response.send_message(content, ephemeral=True)
+    except Exception:
+        logger.debug("hermes-discord-plugin: could not acknowledge stale offer interaction", exc_info=True)
 
 
 async def _inject_choice(adapter: Any, interaction: Any, text: str) -> None:
@@ -306,23 +652,34 @@ async def _inject_choice(adapter: Any, interaction: Any, text: str) -> None:
     await adapter.handle_message(event)
 
 
-def _interaction_matches_card(message: Any, number: str) -> bool:
+def _interaction_matches_card(
+    state: _AdapterState, interaction: Any, message: Any, number: str, job_id: str,
+) -> bool:
     if message is None or not getattr(getattr(message, "author", None), "bot", False):
         return False
+    channel = getattr(interaction, "channel", None)
+    stored = state.offer_store.card_matches(
+        str(getattr(message, "id", "")),
+        str(getattr(channel, "id", "")),
+        job_id,
+        int(number),
+    )
+    if stored is not None:
+        return stored
     embeds = getattr(message, "embeds", ()) or ()
     if not embeds:
         return False
     footer = getattr(getattr(embeds[0], "footer", None), "text", "") or ""
-    return footer.startswith(f"Offre {number}")
+    return footer.startswith(f"Offre {number} · job_id: {job_id}") or (
+        footer.startswith(f"Offre {number} ·") and "job_id:" not in footer
+    )
 
 
 async def _authorized_component(adapter: Any, interaction: Any) -> bool:
     """Use Hermes Discord's component allowlist/pairing check; fail closed if unavailable."""
-    import sys
-
-    module = sys.modules.get(type(adapter).__module__)
-    checker = getattr(module, "_component_check_auth", None) if module else None
+    checker = _component_auth_checker(adapter)
     if not callable(checker):
+        logger.warning("hermes-discord-plugin: Hermes component authorization helper is unavailable")
         return False
     try:
         result = checker(
@@ -352,105 +709,13 @@ _known_adapters: dict[int, _AdapterState] = {}
 
 def _install_interaction_listener(state: _AdapterState) -> None:
     bot = state.bot
-    if id(bot) in state.listener_bots or not callable(getattr(bot, "add_listener", None)):
+    if id(bot) in state.listener_bots:
         return
-    try:
-        bot.add_listener(_on_interaction, "on_interaction")
-    except Exception:
-        logger.warning("hermes-discord-plugin: could not attach cron offer interaction listener", exc_info=True)
+    if not state.interaction_router.attach(bot):
+        logger.warning("hermes-discord-plugin: could not attach component interaction listener")
         return
     state.listener_bots.add(id(bot))
     _known_adapters[id(state.adapter)] = state
-
-
-async def _on_interaction(interaction: Any) -> None:
-    data = getattr(interaction, "data", None) or {}
-    custom_id = data.get("custom_id", "") if isinstance(data, dict) else ""
-    if isinstance(custom_id, str) and custom_id.startswith("hermes_offer|"):
-        await _handle_offer_button(interaction)
-
-
-def _parse_cron_offers(content: Any) -> tuple[Optional[str], list[_Segment]]:
-    """Parse only the explicit numbered-offer format used in Hermes cron deliveries."""
-    if not isinstance(content, str):
-        return None, []
-    header = _CRON_HEADER.search(content)
-    if not header:
-        return None, []
-    job_id = header.group(1)
-    lines = content.splitlines(keepends=True)
-    matches: list[tuple[int, re.Match[str]]] = []
-    offset = 0
-    in_fence = False
-    for line in lines:
-        if line.strip().startswith("```"):
-            in_fence = not in_fence
-        match = _OFFER_HEADING.match(line.rstrip("\r\n"))
-        if match and not in_fence:
-            matches.append((offset, match))
-        offset += len(line)
-    if not matches:
-        return None, []
-
-    segments: list[_Segment] = []
-    first_offset = matches[0][0]
-    prefix = _clean_report_fragment(content[:first_offset])
-    if prefix:
-        segments.append(_Segment(prefix))
-    for index, (start, heading) in enumerate(matches):
-        end = matches[index + 1][0] if index + 1 < len(matches) else len(content)
-        body = _clean_offer_body(content[start + len(heading.group(0)):end])
-        number = int(heading.group(1))
-        if number > 999:
-            return None, []
-        segments.append(_Segment("\n".join((heading.group(0), body)).strip(), _Offer(
-            number=number, title=heading.group(2).strip(), body=body, job_id=job_id,
-        )))
-    offer_numbers = [segment.offer.number for segment in segments if segment.offer]
-    if len(offer_numbers) != len(set(offer_numbers)):
-        return None, []
-    # Avoid attaching identical controls to multiple adapter-generated chunks of one offer.
-    if any(len(segment.text) > 1800 for segment in segments if segment.offer):
-        return None, []
-    if len(matches) < len(content):
-        tail_start = matches[-1][0]
-        tail = content[tail_start:]
-        # Last offer boundary is known from the body parser; retain only after its closing content
-        # when a separate report trailer begins.
-        last = segments[-1]
-        marker = re.search(
-            r"\n\s*(?:⏳|(?:\*\*)?(?:Échéances proches|Non retenues aujourd['’]hui:|Permis B:|Répondez simplement|To stop or manage this job))",
-            tail, re.I,
-        )
-        if marker:
-            offer_end = matches[-1][0] + marker.start()
-            last_body = _clean_offer_body(content[matches[-1][0] + len(matches[-1][1].group(0)):offer_end])
-            last.offer.body = last_body
-            last.text = "\n".join((matches[-1][1].group(0), last_body)).strip()
-            suffix = _clean_report_fragment(content[offer_end:])
-            if suffix:
-                segments.append(_Segment(suffix))
-    return job_id, segments
-
-
-def _clean_report_fragment(text: str) -> str:
-    lines = [line.strip() for line in text.splitlines()]
-    lines = [line for line in lines if line and not _is_fence_or_page_marker(line)]
-    return "\n".join(lines).strip()
-
-
-def _clean_offer_body(text: str) -> str:
-    lines = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or _is_fence_or_page_marker(line) or _ACTION_LINE.match(line):
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
-
-
-def _is_fence_or_page_marker(line: str) -> bool:
-    return line.startswith("```") or bool(re.fullmatch(r"\(?\d+/\d+\)?", line))
 
 
 async def _embed_reply(
@@ -483,8 +748,46 @@ async def _edit_into_embeds(
         message = await _resolve_message(bot, channel, message_id)
         if message is None or not message.content or message.embeds:
             continue
-        embed = build_embed_dict(message.content, color=color, footer=footer if index == last else "")
+        document = parse_message(message.content)
+        segment = document.segments[0] if document.segments else None
+        is_notice = segment is not None and segment.kind in {"alert", "confirmation"}
+        if is_notice:
+            title = segment.title
+            if len(message_ids) > 1:
+                title = f"{title} · partie {index + 1}/{len(message_ids)}"
+        elif len(message_ids) > 1:
+            title = f"Partie {index + 1}/{len(message_ids)}" if index == 0 else f"Suite · partie {index + 1}/{len(message_ids)}"
+        else:
+            title = ""
+        embed = build_embed_dict(
+            _normalize_embed_markdown(segment.text if is_notice else message.content),
+            color=segment.color if is_notice and segment.color is not None else color,
+            footer=footer if index == last else "",
+            title=title,
+        )
         await message.edit(content=None, embed=discord.Embed.from_dict(embed))
+
+
+def _normalize_cron_linebreak_markers(content: str) -> str:
+    """Turn the visible return glyph used by cron summaries into actual line breaks."""
+    if not re.search(r"Cronjob Response:", content, re.I) or "⏎" not in content:
+        return content
+    return re.sub(r"\s*⏎\s*", "\n", content)
+
+
+def _normalize_embed_markdown(content: str) -> str:
+    """Translate Markdown constructs Discord embeds do not render into supported syntax."""
+    lines = []
+    in_fence = False
+    for line in content.splitlines():
+        if is_fence_boundary(line):
+            in_fence = not in_fence
+            lines.append(line)
+        elif in_fence:
+            lines.append(line)
+        else:
+            lines.append(re.sub(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", r"**\1**", line))
+    return "\n".join(lines)
 
 
 def _sent_message_ids(result: Any) -> list[str]:
@@ -540,9 +843,24 @@ def _interaction_route_ready(adapter: Any) -> bool:
     return (
         callable(getattr(adapter, "handle_message", None))
         and callable(getattr(adapter, "build_source", None))
+        and callable(_component_auth_checker(adapter))
         and state is not None
         and id(state.bot) in state.listener_bots
     )
+
+
+def _component_auth_checker(adapter: Any) -> Any:
+    import sys
+
+    module = sys.modules.get(type(adapter).__module__)
+    return getattr(module, "_component_check_auth", None) if module else None
+
+
+def _setting_int(get_setting: GetSetting, key: str, default: int) -> int:
+    try:
+        return int(get_setting(key, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _setting_bool(get_setting: GetSetting, key: str, default: bool) -> bool:

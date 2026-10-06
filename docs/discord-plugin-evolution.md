@@ -1,10 +1,22 @@
 # Pistes d’évolution du plugin Discord Hermes
 
-État observé dans ce dépôt le 6 octobre 2026. Cette note croise l’API Discord officielle avec `__init__.py`, `embeds.py`, `render.py`, `plugin.yaml` et `README.md`. Elle propose une feuille de route, sans modifier le code du plugin.
+État observé dans ce dépôt le 6 octobre 2026. Cette note croise l’API Discord officielle avec `__init__.py`, `embeds.py`, `parser.py`, `message_model.py`, `render.py`, `plugin.yaml` et `README.md`. Elle documente la feuille de route et l’avancement du plugin.
 
 ## Architecture actuelle
 
-Le plugin est un adaptateur local `discord.py` : il mémorise le modèle via `post_llm_call`, récupère le bot et l’adaptateur via `register_platform_handler`, puis enveloppe `send` et `edit_message`. Il convertit les réponses finales en embeds et reconnaît une seule forme de `Cronjob Response`, qu’il découpe en intro, offres numérotées et résumé. Les cartes d’offre ajoutent trois boutons. Les clics passent par le Gateway `on_interaction`, sont soumis au contrôle d’autorisation Hermes et injectent le choix en texte dans la conversation. L’état anti-double-clic (`claimed_clicks`) est seulement en mémoire.
+Le plugin mémorise le modèle via `post_llm_call`, récupère le bot et l’adaptateur avec `register_platform_handler`, puis enveloppe actuellement les chemins `send` et `edit_message`. Le parseur pur (`parser.py`) reconnaît les offres numérotées d’un `Cronjob Response` et préserve le format Markdown. Les alertes et confirmations explicites reçoivent un rendu coloré. Les cartes ordinaires proposent les actions Ignorer/Suivre/Postuler et une modal Remarque; les rapports importants sont paginés avec ◀/▶ et `/cron-pending` retrouve les cartes sans action dans le salon ou thread courant. Le routeur reçoit les interactions via le Gateway et les soumet au contrôle d’autorisation Hermes. `state_store.py` utilise SQLite plugin Hermes pour enregistrer l’identité des cartes, les actions et les remarques; les anciennes versions Hermes retombent en mémoire locale.
+
+## Avancement sur la branche `fix/discord-cron-rendering`
+
+- **Fait** : titres de continuation pour les réponses multi-embeds; préservation des paragraphes, fences et indentations; normalisation des marqueurs `⏎`; conversion des titres Markdown en gras.
+- **Fait** : offres trop longues conservées comme contenu lisible sans bouton, sans faire perdre les autres cartes; `job_id` ajouté à l’identité visuelle de la carte; erreurs d’acquittement et indisponibilité du routeur journalisées.
+- **Fait** : séparation du parseur et du modèle de message du code d’adaptation Discord; présentation dédiée des alertes et confirmations explicites.
+- **Fait** : stockage SQLite profilé des cartes et des actions, avec unicité par message/offre et fallback mémoire si l’API Hermes n’est pas présente.
+- **Fait** : routeur d'interactions général par préfixe `custom_id`, avec priorité au préfixe le plus précis et attachement idempotent au Gateway.
+- **Fait** : pagination des gros rapports d'offres (`cron_report_pagination`) : à partir du seuil configuré, le rapport est envoyé en pages d'embeds (paquetées sous la limite message de 2 000 caractères) avec boutons persistants ◀/▶ et indicateur de page; l'acheminement passe par le routeur générique (`hermes_pager|`), la vérification d'autorisation Hermes et `plugin_db` pour survivre aux redémarrages; repli automatique sur les cartes par offre si la route d'interaction, le stockage ou l'autorisation manque.
+- **Fait** : modal « Remarque » sur chaque carte d'offre non paginée; le texte est validé et envoyé comme événement séparé, protégé par l'autorisation Hermes et une déduplication persistante par carte.
+- **Fait** : commande slash plugin `/cron-pending` via la couture officielle `ctx.register_command` : la liste des cartes d'offre non revendiquées de la conversation est reconstruite depuis `plugin_db` (numéro, job_id, note en attente), après suppression ou redémarrage. L'enregistrement Discord est fait par l'adaptateur Hermes lui-même (noyau `_NATIVE_SLASH_COMMANDS` + miroir `_iter_plugin_command_entries`), le dispatch passe par la même voie que les commandes natives (`gateway/run_inbound.py::_hm_dispatch_quick_and_plugin_commands`, accès slash Hermes, gate de drain, env de session) ; le plugin ne touche ni l'arbre, ni le sync, ni les limites. Portée : globale (pas de couture par-serveur chez Hermes) ; les commandes plugin sont abandonnées en premier si la limite de 100 commandes est atteinte. Les commandes contextuelles (message/utilisateur) et les options typées ne sont pas exposées par cette couture : hors périmètre pour l'instant.
+- **À faire** : menus de sélection pour les listes longues, réglages visuels par conversation et dispatch embed natif après ajout d'un hook d'envoi officiel côté Hermes.
 
 ## Capacités Discord utiles
 
@@ -21,19 +33,21 @@ Le plugin est un adaptateur local `discord.py` : il mémorise le modèle via `po
 
 Garder le Gateway partagé avec Hermes, mais formaliser un routeur de composants unique. Accuser immédiatement le clic (réponse éphémère ou defer), puis exécuter l’action Hermes et mettre à jour la carte : choix sélectionné, action horodatée, contrôles désactivés ou bouton « Annuler/modifier ». Valider `custom_id`, salon/thread, auteur du message, job et numéro contre un enregistrement connu, pas seulement contre le texte du message. Rendre l’action idempotente afin que double-clic, retransmission Gateway ou redémarrage ne crée pas plusieurs décisions.
 
-L’état qui lie `job_id`, numéro d’offre, message Discord et conversation Hermes devrait être durable (petite base SQLite ou stockage fourni par Hermes). Aujourd’hui les `custom_id` gardent job/numéro/action, mais `claimed_clicks` disparaît au redémarrage. Les interactions Discord ne sont pas une file d’attente durable pour les décisions métier; répondre rapidement et persister avant l’accusé évite de perdre un choix. Garder un fallback textuel si la livraison interactive est indisponible.
+L’identité qui lie `job_id`, numéro d’offre et message Discord est maintenant conservée par `plugin_db`; le même registre sert à vérifier le clic sans dépendre seulement du texte du footer. La revendication de l’action est persistée avant le defer Discord. Les interactions Discord ne sont pas une file d’attente durable pour les décisions métier : si l’injection Hermes échoue avant confirmation, le claim en attente est libéré quand la suppression SQLite aboutit. Garder un fallback textuel si la livraison interactive est indisponible.
 
 ### 2. Séparer le parseur du rendu Discord
 
-Remplacer le parseur regex focalisé sur une seule mise en page par un modèle interne : rapport, sections, items/actionnables, pièces jointes et liens. Ajouter des parseurs explicites pour les rapports d’offres, listes de tâches, sondages, confirmations, résumés et alertes; en absence de format reconnu, rendre le message normalement. Assurer que l’envoi conserve la réponse logique attendue par Hermes lorsque le plugin transforme un message en plusieurs cartes. Faire un envoi natif avec embed/components si la couture d’adaptateur le permet, au lieu du flash texte puis édition actuellement documenté.
+Étendre le modèle interne vers des sections, listes actionnables, pièces jointes et liens, puis ajouter des parseurs explicites pour les listes de tâches, sondages et résumés; en absence de format reconnu, rendre le message normalement. Le modèle et les parsers actuels séparent déjà les données de l’adaptateur Discord. L’envoi natif embed/components attend un hook pré-envoi Hermes : l’API Discord actuelle de l’adaptateur ne prend que du texte et le plugin édite ensuite le message, ce qui préserve le chemin de livraison existant.
 
 ### 3. Étendre les interactions selon le cas d’usage
 
 - Une **sélection déroulante** convient aux longues listes d’actions/éléments, où plusieurs séries de boutons par carte encombreraient le salon.
 - Une **modal** permet de demander une remarque, une raison de rejet, une date ou un complément sans obliger à écrire un message séparé.
-- Des **slash commands** comme `/hermes status`, `/hermes stop`, `/hermes cron list`, `/hermes cron run` et `/hermes config` offrent des commandes découvrables et des entrées typées. Démarrer dans un serveur de test, puis enregistrer globalement si désiré.
-- Une **commande contextuelle de message** peut proposer « Envoyer à Hermes », « Résumer » ou « Continuer dans ce thread » sur n’importe quel message.
-- Un **mode pagination** peut regrouper les résultats et réduire le nombre de messages, avec boutons précédent/suivant et état de page. Les composants par message ont un budget de structure limité; éviter trois boutons pour chacune de dizaines d’offres.
+- Des **slash commands** comme `/hermes status`, `/hermes stop`, `/hermes cron list`, `/hermes cron run` et `/hermes config` offrent des commandes découvrables et des entrées typées. Le plugin a ajouté `/cron-pending` via `PluginContext.register_command`; cette API expose un nom global et un argument texte brut facultatif. Chez Hermes, Discord enregistre les commandes globalement et ne fournit pas encore de synchronisation par serveur, d'options typées ou de commandes d'application imbriquées. Les commandes de plugin passent par le proxy Hermes qui applique ses contrôles d'accès.
+- Une **commande contextuelle de message** peut proposer « Envoyer à Hermes », « Résumer » ou « Continuer dans ce thread » sur n’importe quel message. L'API de plugin Hermes inspectée ne déclare pas d'inscription de commandes contextuelles; il faut un point d'extension amont avant de l'implémenter dans ce plugin.
+- Un **mode pagination** peut regrouper les résultats et réduire le nombre de messages, avec boutons précédent/suivant et état de page. Les composants par message ont un budget de structure limité; éviter trois boutons pour chacune de dizaines d'offres.
+
+Le rendu natif en une seule opération reste bloqué par le contrat actuel de l'adaptateur Discord : `send(chat_id, content, reply_to, metadata)` ne reçoit que du texte, découpe ce texte, puis l'envoie. Le plugin transforme ensuite les messages en embeds par édition. `register_platform_handler` n'expose pas de paramètre embed/component pour ce chemin; il faudrait d'abord un hook de rendu pré-envoi côté Hermes pour éviter le flash texte puis édition sans contourner le ledger de livraison.
 
 ### 4. Améliorer la présentation et l’exploitation
 
@@ -42,7 +56,7 @@ Ajouter des thèmes/configurations par conversation, langue et densité; rendre 
 ## Priorités et critères d’acceptation
 
 1. **P0 — robustesse des offres** : test des formats incomplets et des messages multipart; clic accepté/refusé; action acquittée en moins de 3 s; clic répété sans effet métier doublé; action routée vers le bon thread; reprise après redémarrage avec confirmation éditée ou état expiré clairement signalé.
-2. **P1 — interaction générique** : sélecteur/modal avec réponse éphémère; pagination; tests de limites d’embed et de composants; aucune action interactive affichée quand le routeur entrant est indisponible.
-3. **P2 — contrôle Hermes depuis Discord** : commandes de statut, cron et gestion de conversation, installables d’abord à l’échelle d’un serveur de test.
+2. **P1 — interaction générique** : sélecteur si de longues listes le justifient; pagination; validation continue des limites d’embed et de composants; aucune action interactive affichée quand le routeur entrant est indisponible.
+3. **P2 — contrôle Hermes depuis Discord** : étendre `/cron-pending` à la gestion des cronjobs et de la conversation après ajout d’options typées et de scopes de serveur dans Hermes. L’inscription actuelle est globale et son handler texte passe par le contrôle d’accès Hermes.
 
 Les limites Discord changent avec l’API. Le plugin devrait s’appuyer sur les constantes et validations de `discord.py`, documenter la version d’API et traiter proprement les erreurs HTTP, plutôt que dupliquer des nombres dispersés dans le code.
