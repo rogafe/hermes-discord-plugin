@@ -16,6 +16,14 @@ _PLUGIN_NAME = "hermes-discord-plugin"
 _DATABASE_LOCK = threading.RLock()
 _MEMORY_LIMIT = 256
 
+# Retention for pager state ("forget()" was otherwise never called in production):
+# keep pager buttons working across restarts without growing the store forever.
+# A page embed whose state was already pruned still degrades gracefully on click
+# ("Cette pagination n'est plus disponible."); fresh reports keep their buttons.
+PAGE_RETENTION_SECONDS = 7 * 24 * 3600
+PAGE_ROW_LIMIT = 200
+_PRUNE_EVERY_SAVES = 8
+
 
 class PageStore:
     """Store one packed page list per Discord message that carries a pager."""
@@ -23,6 +31,7 @@ class PageStore:
     def __init__(self) -> None:
         self._memory_pages: dict[str, tuple[str, str, list[str], str]] = {}
         self._storage_supported: Optional[bool] = None
+        self._saves_since_prune = 0
 
     def save(self, message_id: str, channel_id: str, job_id: str, pages: list[str], footer: str = "") -> bool:
         with _DATABASE_LOCK:
@@ -31,7 +40,13 @@ class PageStore:
             except Exception:
                 logger.warning("hermes-discord-plugin: could not persist pagination state", exc_info=True)
                 return False
+            self._saves_since_prune += 1
+            due = self._saves_since_prune >= _PRUNE_EVERY_SAVES
+            if due:
+                self._saves_since_prune = 0
             if connection is None:
+                # Memory fallback: already bounded by the FIFO eviction above (no
+                # timestamps are kept there, so age-based pruning cannot apply).
                 if len(self._memory_pages) >= _MEMORY_LIMIT:
                     self._memory_pages.pop(next(iter(self._memory_pages)), None)
                 self._memory_pages[str(message_id)] = (str(channel_id), str(job_id), list(pages), str(footer))
@@ -46,11 +61,53 @@ class PageStore:
                     (str(message_id), str(channel_id), str(job_id), len(pages), payload,
                      str(footer), int(time.time())),
                 )
+                if due:
+                    # After the insert, so the newest report always counts toward the row limit.
+                    self._prune_connection(connection, PAGE_RETENTION_SECONDS, PAGE_ROW_LIMIT)
                 connection.commit()
                 return True
             except Exception:
                 logger.warning("hermes-discord-plugin: could not write pagination state", exc_info=True)
                 return False
+
+    def prune(self, max_age_seconds: int = PAGE_RETENTION_SECONDS, max_rows: int = PAGE_ROW_LIMIT) -> None:
+        """Bound the durable pager state; the production cleanup path for page rows.
+
+        Drops rows older than ``max_age_seconds`` and, if rows remain beyond
+        ``max_rows``, keeps only the newest ones. Run opportunistically from
+        :meth:`save` (amortized every few saves), never from the click path, so
+        pager state never grows unbounded while recently delivered reports stay
+        navigable after restarts. An already-pruned page still degrades
+        gracefully on click ("Cette pagination n'est plus disponible.").
+        """
+        with _DATABASE_LOCK:
+            try:
+                connection = self._connection()
+            except Exception:
+                logger.debug("hermes-discord-plugin: could not prune pagination state", exc_info=True)
+                return
+            if connection is None:
+                return
+            try:
+                self._ensure_schema(connection)
+                self._prune_connection(connection, max_age_seconds, max_rows)
+                connection.commit()
+            except Exception:
+                logger.debug("hermes-discord-plugin: could not prune pagination state", exc_info=True)
+
+    @staticmethod
+    def _prune_connection(connection: Any, max_age_seconds: int, max_rows: int) -> None:
+        """Delete expired rows, then rows beyond the newest ``max_rows`` (caller commits)."""
+        cutoff = int(time.time()) - int(max_age_seconds)
+        connection.execute(
+            "DELETE FROM hermes_discord_report_pages WHERE created_at < ?", (cutoff,),
+        )
+        connection.execute(
+            "DELETE FROM hermes_discord_report_pages WHERE message_id NOT IN ("
+            "SELECT message_id FROM hermes_discord_report_pages "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?)",
+            (int(max_rows),),
+        )
 
     def load(self, message_id: str, channel_id: str, job_id: str) -> Optional[tuple[list[str], str]]:
         """Return the stored pages and model footer only when the click context matches."""

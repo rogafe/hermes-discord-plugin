@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import inspect
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
@@ -14,7 +15,7 @@ from .page_store import PageStore
 from .parser import is_fence_boundary, parse_message
 from .pagination import build_report_pages, custom_id as pager_custom_id, should_paginate
 from .render import build_embed_dict, build_offer_embed_dict, build_report_embed_dict, footer_text, parse_color
-from .state_store import OfferStateStore
+from .state_store import RECOVERY_GRACE_SECONDS, OfferStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -450,7 +451,10 @@ async def _handle_offer_button(interaction: Any) -> None:
     interaction_id = str(getattr(interaction, "id", ""))
     user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
     if not state.offer_store.claim(message_id, job_id, int(number), interaction_id, action, user_id):
-        await _respond_ephemeral(interaction, "Une action a déjà été envoyée pour cette carte.")
+        await _respond_ephemeral(interaction, _claim_blocked_message(
+            state, message_id, job_id, int(number), fallback=(
+                "Une action a déjà été envoyée pour cette carte."),
+        ))
         return
 
     committed = False
@@ -548,7 +552,11 @@ async def _handle_note_modal(interaction: Any) -> None:
     message_id = str(getattr(message, "id", ""))
     user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
     if not state.offer_store.save_note(message_id, job_id, int(number), user_id):
-        await _respond_ephemeral(interaction, "Une remarque a déjà été envoyée pour cette carte.")
+        await _respond_ephemeral(interaction, _claim_blocked_message(
+            state, message_id, job_id, int(number), fallback=(
+                "Une remarque a déjà été envoyée pour cette carte."),
+            note=True,
+        ))
         return
 
     committed = False
@@ -559,6 +567,7 @@ async def _handle_note_modal(interaction: Any) -> None:
             f"{number} 🗒️ Remarque (job_id: {job_id}) : {note_text}",
         )
         committed = True
+        state.offer_store.commit_note(message_id, job_id, int(number))
         await interaction.followup.send(
             f"Remarque transmise à Hermes pour l’offre {number}.", ephemeral=True,
         )
@@ -597,6 +606,55 @@ def _modal_text_value(interaction: Any, component_custom_id: str) -> str:
                     if text:
                         return text
     return ""
+
+
+def _claim_blocked_message(
+    state: _AdapterState, message_id: str, job_id: str, offer_number: int, *,
+    fallback: str, note: bool = False,
+) -> str:
+    """Message shown when a store slot blocks a click, honest about what we know.
+
+    A committed claim really did reach Hermes. A fresh pending claim is someone
+    else's live dispatch. An old pending claim means a dispatch was interrupted,
+    but it may have completed just before the process exited — we cannot prove
+    either outcome, so the message says so and explains the explicit recovery.
+    """
+    subject = "remarque" if note else "action"
+    if note:
+        status = state.offer_store.note_status(message_id, job_id, offer_number)
+        if status is None:
+            return fallback
+        record_state, elapsed = status
+    else:
+        status = state.offer_store.claim_status(message_id, job_id, offer_number)
+        if status is None:
+            return fallback
+        record_state, _action, elapsed = status
+        record_state = record_state or "pending"
+    if record_state == "committed":
+        return fallback
+    age = _age_seconds(elapsed)
+    if age is not None and age > RECOVERY_GRACE_SECONDS:
+        word = "Une remarque sur cette carte a été interrompue" if note else (
+            "Une action sur cette carte a été interrompue")
+        return (
+            f"⚠️ {word} : soit elle a été transmise à Hermes juste avant un arrêt, "
+            "soit elle n'a jamais été envoyée — impossible de le garantir. "
+            "Pour débloquer la carte : /cron-recover dans cette conversation "
+            "(la slot sera libérée), ou réponds en texte si tu sais que rien n'a "
+            "été transmis. Attention : si l'original était bien parti, le relancer "
+            "pourrait créer une décision en double."
+        )
+    return f"Une {subject} est déjà en traitement pour cette carte ; réessaie dans quelques instants."
+
+
+def _age_seconds(timestamp: Any) -> Optional[float]:
+    try:
+        if not timestamp:
+            return None
+        return max(0.0, time.time() - int(timestamp))
+    except (TypeError, ValueError):
+        return None
 
 
 async def _respond_ephemeral(interaction: Any, content: str) -> None:
