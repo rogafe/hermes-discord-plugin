@@ -69,10 +69,15 @@ channel or thread. Button custom IDs carry only the job ID, offer number, and ac
 back in the interaction payload. An offer too long for one interactive card stays readable as a regular
 report segment; the remaining offers keep their buttons.
 
+Offer-card identities and one-action-per-card claims use Hermes' profile-scoped SQLite plugin store, so
+duplicate clicks remain blocked after a gateway restart. Older Hermes versions without that storage API
+fall back to process-local state.
+
 Multi-message replies receive `Partie 1/N` / `Suite · partie N/N` titles. Cron report fragments retain blank
 lines, indentation, and fenced code blocks, and Markdown headings are converted to bold because Discord
 embeds do not render `#` headings. The visible `⏎` line-break marker found in some cron output is normalized
-to a real newline.
+to a real newline. Explicit alerts (`🚨`, `⚠️`, `🔴`) and confirmation outcomes (`Confirmation requise:`,
+`✅ Confirmé`, `❌ Annulé`) receive a titled, color-coded embed; these presentation cues do not trigger actions.
 
 Any failure leaves the plain-text reply as it was.
 

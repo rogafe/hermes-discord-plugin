@@ -4,39 +4,20 @@ from __future__ import annotations
 import logging
 import re
 import inspect
-import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
+from .message_model import Offer, Segment
+from .interaction_router import InteractionRouter
 from .models import ModelTracker
+from .parser import is_fence_boundary, parse_message
 from .render import build_embed_dict, build_offer_embed_dict, footer_text, parse_color
+from .state_store import OfferStateStore
 
 logger = logging.getLogger(__name__)
 
 _STATE_ATTR = "_hermes_discord_embeds"
-_CRON_HEADER = re.compile(
-    r"^[ \t]*Cronjob Response:[^\r\n]*\r?\n[ \t]*\(job_id:[ \t]*([A-Za-z0-9_-]+)[ \t]*\)",
-    re.I | re.M,
-)
-_OFFER_HEADING = re.compile(r"^\s*\*\*\[(\d+)\]\s*(.*?)\*\*\s*(?:🆕)?\s*$")
-_ACTION_LINE = re.compile(r"^\s*(?:🗑️|👀|📝)\s*(?:Ignore|Ignorer|Follow|Suivre|Va postuler).*$", re.I)
-
 GetSetting = Callable[[str, Any], Any]
-
-
-@dataclass
-class _Offer:
-    number: int
-    title: str
-    body: str
-    job_id: str
-
-
-@dataclass
-class _Segment:
-    text: str
-    offer: Optional[_Offer] = None
 
 
 class _AdapterState:
@@ -48,8 +29,9 @@ class _AdapterState:
         self.tracker = tracker
         self.get_setting = get_setting
         self.listener_bots: set[int] = set()
-        self.claimed_clicks: set[tuple[str, str]] = set()
-        self.click_lock = threading.Lock()
+        self.interaction_router = InteractionRouter()
+        self.interaction_router.register("hermes_offer|", _handle_offer_button)
+        self.offer_store = OfferStateStore()
 
 
 def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSetting) -> None:
@@ -72,14 +54,15 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
         if isinstance(content, str) and bool(metadata and metadata.get("notify")):
             content = _normalize_cron_linebreak_markers(content)
         if (
-            bool(metadata and metadata.get("notify"))
+            isinstance(content, str)
+            and bool(metadata and metadata.get("notify"))
             and _setting_bool(get_setting, "enabled", True)
             and _setting_bool(get_setting, "cron_offer_interactions", True)
         ):
-            job_id, segments = _parse_cron_offers(content)
-            if job_id and segments:
+            document = parse_message(content)
+            if document.source_format == "cron_offer_report" and document.segments:
                 return await _send_cron_offer_segments(
-                    state, original_send, chat_id, segments, reply_to, metadata,
+                    state, original_send, chat_id, document.segments, reply_to, metadata,
                 )
 
         result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
@@ -105,7 +88,7 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
 
 
 async def _send_cron_offer_segments(
-    state: _AdapterState, original_send: Callable, chat_id: Any, segments: list[_Segment],
+    state: _AdapterState, original_send: Callable, chat_id: Any, segments: list[Segment],
     reply_to: Any, metadata: Optional[dict],
 ) -> Any:
     """Send report context and each offer separately, preserving the adapter's send path."""
@@ -113,7 +96,7 @@ async def _send_cron_offer_segments(
     model_keys = _route_keys(chat_id, metadata)
     # Consume once for the whole logical response so the model footer cannot leak to a later turn.
     model = tracker.take(model_keys)
-    sent: list[tuple[_Segment, list[str]]] = []
+    sent: list[tuple[Segment, list[str]]] = []
     result = None
     for index, segment in enumerate(segments):
         result = await original_send(
@@ -146,7 +129,7 @@ async def _send_cron_offer_segments(
 
 async def _decorate_cron_segments(
     state: _AdapterState, chat_id: Any, metadata: Optional[dict],
-    sent: list[tuple[_Segment, list[str]]], model: Optional[str],
+    sent: list[tuple[Segment, list[str]]], model: Optional[str],
 ) -> None:
     import discord
 
@@ -163,6 +146,11 @@ async def _decorate_cron_segments(
     footer = footer_text(model, state.get_setting("footer_template", None)) if model else ""
     color = parse_color(state.get_setting("color", None))
     buttons_enabled = _setting_bool(state.get_setting, "cron_offer_buttons", True)
+    interaction_ready = _interaction_route_ready(state.adapter)
+    if buttons_enabled and not interaction_ready and any(segment.offer for segment, _id in all_ids):
+        logger.warning(
+            "hermes-discord-plugin: cron offer buttons omitted: inbound Discord interaction route unavailable"
+        )
 
     for segment, message_id in all_ids:
         message = await _resolve_message(state.bot, channel, message_id)
@@ -175,7 +163,12 @@ async def _decorate_cron_segments(
                 segment.offer.title, _normalize_embed_markdown(segment.offer.body), color=color,
                 number=segment.offer.number, footer=message_footer, job_id=segment.offer.job_id,
             )
-            view = _offer_view(segment.offer) if buttons_enabled and _interaction_route_ready(state.adapter) else None
+            stored = state.offer_store.register_card(
+                str(message.id), str(channel.id), segment.offer.job_id, segment.offer.number,
+            ) if buttons_enabled and interaction_ready else False
+            view = _offer_view(segment.offer) if buttons_enabled and interaction_ready and stored else None
+            if buttons_enabled and interaction_ready and not stored:
+                logger.warning("hermes-discord-plugin: cron offer buttons omitted: card identity could not be stored")
             try:
                 await message.edit(content=None, embed=discord.Embed.from_dict(embed_data), view=view)
             except Exception as exc:
@@ -194,7 +187,7 @@ async def _decorate_cron_segments(
                 logger.warning("hermes-discord-plugin: could not render report message %s: %s", message_id, exc)
 
 
-def _offer_view(offer: _Offer):
+def _offer_view(offer: Offer):
     import discord
 
     if len(offer.job_id) > 72:
@@ -245,28 +238,27 @@ async def _handle_offer_button(interaction: Any) -> None:
         return
 
     message = getattr(interaction, "message", None)
-    if not _interaction_matches_card(message, number, job_id):
+    if not _interaction_matches_card(state, interaction, message, number, job_id):
         await _respond_ephemeral(interaction, "Ce bouton ne correspond plus à une carte d’offre valide.")
         return
-    claim_key = (str(getattr(message, "id", "")), job_id)
-    with state.click_lock:
-        already_claimed = claim_key in state.claimed_clicks
-        if not already_claimed:
-            state.claimed_clicks.add(claim_key)
-    if already_claimed:
-        await _respond_ephemeral(interaction, "Une action a déjà été envoyée pour cette carte.")
-        return
-
     emoji, label = {
         "ignore": ("🗑️", "Ignorer"),
         "follow": ("👀", "Suivre"),
         "apply": ("📝", "Postuler"),
     }[action]
+    message_id = str(getattr(message, "id", ""))
+    interaction_id = str(getattr(interaction, "id", ""))
+    user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+    if not state.offer_store.claim(message_id, job_id, int(number), interaction_id, action, user_id):
+        await _respond_ephemeral(interaction, "Une action a déjà été envoyée pour cette carte.")
+        return
+
     committed = False
     try:
         await interaction.response.defer(ephemeral=True)
         await _inject_choice(state.adapter, interaction, f"{number} {emoji} (job_id: {job_id})")
         committed = True
+        state.offer_store.commit_claim(message_id, job_id, int(number), interaction_id)
         if getattr(interaction, "message", None) is not None:
             try:
                 await interaction.message.edit(view=None)
@@ -275,8 +267,7 @@ async def _handle_offer_button(interaction: Any) -> None:
         await interaction.followup.send(f"Choix transmis à Hermes : offre {number} — {label}.", ephemeral=True)
     except Exception as exc:
         if not committed:
-            with state.click_lock:
-                state.claimed_clicks.discard(claim_key)
+            state.offer_store.release_claim(message_id, job_id, int(number), interaction_id)
         logger.warning("hermes-discord-plugin: could not route cron offer interaction: %s", exc)
         try:
             if getattr(interaction.response, "is_done", lambda: False)():
@@ -340,9 +331,20 @@ async def _inject_choice(adapter: Any, interaction: Any, text: str) -> None:
     await adapter.handle_message(event)
 
 
-def _interaction_matches_card(message: Any, number: str, job_id: str) -> bool:
+def _interaction_matches_card(
+    state: _AdapterState, interaction: Any, message: Any, number: str, job_id: str,
+) -> bool:
     if message is None or not getattr(getattr(message, "author", None), "bot", False):
         return False
+    channel = getattr(interaction, "channel", None)
+    stored = state.offer_store.card_matches(
+        str(getattr(message, "id", "")),
+        str(getattr(channel, "id", "")),
+        job_id,
+        int(number),
+    )
+    if stored is not None:
+        return stored
     embeds = getattr(message, "embeds", ()) or ()
     if not embeds:
         return False
@@ -386,130 +388,13 @@ _known_adapters: dict[int, _AdapterState] = {}
 
 def _install_interaction_listener(state: _AdapterState) -> None:
     bot = state.bot
-    if id(bot) in state.listener_bots or not callable(getattr(bot, "add_listener", None)):
+    if id(bot) in state.listener_bots:
         return
-    try:
-        bot.add_listener(_on_interaction, "on_interaction")
-    except Exception:
-        logger.warning("hermes-discord-plugin: could not attach cron offer interaction listener", exc_info=True)
+    if not state.interaction_router.attach(bot):
+        logger.warning("hermes-discord-plugin: could not attach component interaction listener")
         return
     state.listener_bots.add(id(bot))
     _known_adapters[id(state.adapter)] = state
-
-
-async def _on_interaction(interaction: Any) -> None:
-    data = getattr(interaction, "data", None) or {}
-    custom_id = data.get("custom_id", "") if isinstance(data, dict) else ""
-    if isinstance(custom_id, str) and custom_id.startswith("hermes_offer|"):
-        await _handle_offer_button(interaction)
-
-
-def _parse_cron_offers(content: Any) -> tuple[Optional[str], list[_Segment]]:
-    """Parse only the explicit numbered-offer format used in Hermes cron deliveries."""
-    if not isinstance(content, str):
-        return None, []
-    header = _CRON_HEADER.search(content)
-    if not header:
-        if content.lstrip().lower().startswith("cronjob response:"):
-            logger.warning("hermes-discord-plugin: cron response ignored: missing or malformed job_id header")
-        return None, []
-    job_id = header.group(1)
-    lines = content.splitlines(keepends=True)
-    matches: list[tuple[int, re.Match[str]]] = []
-    offset = 0
-    in_fence = False
-    for line in lines:
-        if _is_fence_boundary(line):
-            in_fence = not in_fence
-        match = _OFFER_HEADING.match(line.rstrip("\r\n"))
-        if match and not in_fence:
-            matches.append((offset, match))
-        offset += len(line)
-    if not matches:
-        return None, []
-
-    segments: list[_Segment] = []
-    first_offset = matches[0][0]
-    prefix = _clean_report_fragment(content[:first_offset])
-    if prefix:
-        segments.append(_Segment(prefix))
-    for index, (start, heading) in enumerate(matches):
-        end = matches[index + 1][0] if index + 1 < len(matches) else len(content)
-        body = _clean_offer_body(content[start + len(heading.group(0)):end])
-        number = int(heading.group(1))
-        if number > 999:
-            logger.warning("hermes-discord-plugin: cron response ignored: offer number exceeds component limit")
-            return None, []
-        segments.append(_Segment("\n".join((heading.group(0), body)).strip(), _Offer(
-            number=number, title=heading.group(2).strip(), body=body, job_id=job_id,
-        )))
-    offer_numbers = [segment.offer.number for segment in segments if segment.offer]
-    if len(offer_numbers) != len(set(offer_numbers)):
-        logger.warning("hermes-discord-plugin: cron response ignored: duplicate offer numbers")
-        return None, []
-    tail_start = matches[-1][0]
-    tail = content[tail_start:]
-    # Last offer boundary is known from the body parser; retain only after its closing content
-    # when a separate report trailer begins.
-    last = segments[-1]
-    marker = re.search(
-        r"\n\s*(?:⏳|(?:\*\*)?(?:Échéances proches|Non retenues aujourd['’]hui:|Permis B:|Répondez simplement|To stop or manage this job))",
-        tail, re.I,
-    )
-    if marker:
-        offer_end = matches[-1][0] + marker.start()
-        last_body = _clean_offer_body(content[matches[-1][0] + len(matches[-1][1].group(0)):offer_end])
-        last.offer.body = last_body
-        last.text = "\n".join((matches[-1][1].group(0), last_body)).strip()
-        suffix = _clean_report_fragment(content[offer_end:])
-        if suffix:
-            segments.append(_Segment(suffix))
-    # Keep the rest of the report structured when one unusually long offer cannot fit
-    # on a single interactive card. That offer remains readable without unsafe duplicate buttons.
-    for index, segment in enumerate(segments):
-        if segment.offer and len(segment.text) > 1800:
-            logger.info(
-                "hermes-discord-plugin: long cron offer kept readable without buttons (offer=%d)",
-                segment.offer.number,
-            )
-            segments[index] = _Segment(segment.text)
-    return job_id, segments
-
-
-def _clean_report_fragment(text: str) -> str:
-    return _clean_cron_fragment(text)
-
-
-def _clean_offer_body(text: str) -> str:
-    return _clean_cron_fragment(text, remove_actions=True)
-
-
-def _clean_cron_fragment(text: str, *, remove_actions: bool = False) -> str:
-    """Drop adapter markers outside code while preserving source spacing and Markdown."""
-    lines = []
-    in_fence = False
-    for line in text.splitlines():
-        if _is_fence_boundary(line):
-            lines.append(line)
-            in_fence = not in_fence
-            continue
-        if not in_fence and (_is_page_marker(line) or (remove_actions and _ACTION_LINE.match(line))):
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
-
-
-def _is_page_marker(line: str) -> bool:
-    return bool(re.fullmatch(r"\s*\(?\d+/\d+\)?\s*", line))
-
-
-def _is_fence_boundary(line: str) -> bool:
-    stripped = line.strip()
-    if not re.match(r"^(?:```|~~~)", stripped):
-        return False
-    # Inline fenced snippets such as ```py x = 1``` do not open/close a block.
-    fence = "```" if stripped.startswith("```") else "~~~"
-    return stripped == fence or not stripped.endswith(fence)
 
 
 async def _embed_reply(
@@ -542,14 +427,22 @@ async def _edit_into_embeds(
         message = await _resolve_message(bot, channel, message_id)
         if message is None or not message.content or message.embeds:
             continue
+        document = parse_message(message.content)
+        segment = document.segments[0] if document.segments else None
+        is_notice = segment is not None and segment.kind in {"alert", "confirmation"}
+        if is_notice:
+            title = segment.title
+            if len(message_ids) > 1:
+                title = f"{title} · partie {index + 1}/{len(message_ids)}"
+        elif len(message_ids) > 1:
+            title = f"Partie {index + 1}/{len(message_ids)}" if index == 0 else f"Suite · partie {index + 1}/{len(message_ids)}"
+        else:
+            title = ""
         embed = build_embed_dict(
-            _normalize_embed_markdown(message.content),
-            color=color,
+            _normalize_embed_markdown(segment.text if is_notice else message.content),
+            color=segment.color if is_notice and segment.color is not None else color,
             footer=footer if index == last else "",
-            title=(
-                f"Partie {index + 1}/{len(message_ids)}" if index == 0
-                else f"Suite · partie {index + 1}/{len(message_ids)}"
-            ) if len(message_ids) > 1 else "",
+            title=title,
         )
         await message.edit(content=None, embed=discord.Embed.from_dict(embed))
 
@@ -566,7 +459,7 @@ def _normalize_embed_markdown(content: str) -> str:
     lines = []
     in_fence = False
     for line in content.splitlines():
-        if _is_fence_boundary(line):
+        if is_fence_boundary(line):
             in_fence = not in_fence
             lines.append(line)
         elif in_fence:

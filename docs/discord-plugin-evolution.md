@@ -1,10 +1,19 @@
 # Pistes d’évolution du plugin Discord Hermes
 
-État observé dans ce dépôt le 6 octobre 2026. Cette note croise l’API Discord officielle avec `__init__.py`, `embeds.py`, `render.py`, `plugin.yaml` et `README.md`. Elle propose une feuille de route, sans modifier le code du plugin.
+État observé dans ce dépôt le 6 octobre 2026. Cette note croise l’API Discord officielle avec `__init__.py`, `embeds.py`, `parser.py`, `message_model.py`, `render.py`, `plugin.yaml` et `README.md`. Elle documente la feuille de route et l’avancement du plugin.
 
 ## Architecture actuelle
 
-Le plugin est un adaptateur local `discord.py` : il mémorise le modèle via `post_llm_call`, récupère le bot et l’adaptateur via `register_platform_handler`, puis enveloppe `send` et `edit_message`. Il convertit les réponses finales en embeds et reconnaît une seule forme de `Cronjob Response`, qu’il découpe en intro, offres numérotées et résumé. Les cartes d’offre ajoutent trois boutons. Les clics passent par le Gateway `on_interaction`, sont soumis au contrôle d’autorisation Hermes et injectent le choix en texte dans la conversation. L’état anti-double-clic (`claimed_clicks`) est seulement en mémoire.
+Le plugin est un adaptateur local `discord.py` : il mémorise le modèle via `post_llm_call`, récupère le bot et l’adaptateur via `register_platform_handler`, puis enveloppe `send` et `edit_message`. Le parseur pur (`parser.py`) reconnaît les offres numérotées d’un `Cronjob Response` et préserve le format Markdown. Les alertes et confirmations explicites reçoivent un rendu coloré, sans action automatique. Les cartes d’offre ajoutent trois boutons. Les clics passent par le Gateway `on_interaction`, sont soumis au contrôle d’autorisation Hermes et injectent le choix en texte dans la conversation. `state_store.py` utilise l’API de stockage plugin Hermes et SQLite pour enregistrer l’identité des cartes et refuser un second choix après redémarrage; les anciennes versions Hermes retombent en mémoire locale.
+
+## Avancement sur la branche `fix/discord-cron-rendering`
+
+- **Fait** : titres de continuation pour les réponses multi-embeds; préservation des paragraphes, fences et indentations; normalisation des marqueurs `⏎`; conversion des titres Markdown en gras.
+- **Fait** : offres trop longues conservées comme contenu lisible sans bouton, sans faire perdre les autres cartes; `job_id` ajouté à l’identité visuelle de la carte; erreurs d’acquittement et indisponibilité du routeur journalisées.
+- **Fait** : séparation du parseur et du modèle de message du code d’adaptation Discord; présentation dédiée des alertes et confirmations explicites.
+- **Fait** : stockage SQLite profilé des cartes et des actions, avec unicité par message/offre et fallback mémoire si l’API Hermes n’est pas présente.
+- **Fait** : routeur d’interactions général par préfixe `custom_id`, avec priorité au préfixe le plus précis et attachement idempotent au Gateway.
+- **À faire** : pagination et menus de sélection, modals, commandes slash/contextuelles, réglages visuels par conversation et dispatch embed natif. Ordre recommandé : pagination après le routeur; menus seulement pour les listes longues; commandes après validation du dispatch Hermes.
 
 ## Capacités Discord utiles
 
@@ -21,7 +30,7 @@ Le plugin est un adaptateur local `discord.py` : il mémorise le modèle via `po
 
 Garder le Gateway partagé avec Hermes, mais formaliser un routeur de composants unique. Accuser immédiatement le clic (réponse éphémère ou defer), puis exécuter l’action Hermes et mettre à jour la carte : choix sélectionné, action horodatée, contrôles désactivés ou bouton « Annuler/modifier ». Valider `custom_id`, salon/thread, auteur du message, job et numéro contre un enregistrement connu, pas seulement contre le texte du message. Rendre l’action idempotente afin que double-clic, retransmission Gateway ou redémarrage ne crée pas plusieurs décisions.
 
-L’état qui lie `job_id`, numéro d’offre, message Discord et conversation Hermes devrait être durable (petite base SQLite ou stockage fourni par Hermes). Aujourd’hui les `custom_id` gardent job/numéro/action, mais `claimed_clicks` disparaît au redémarrage. Les interactions Discord ne sont pas une file d’attente durable pour les décisions métier; répondre rapidement et persister avant l’accusé évite de perdre un choix. Garder un fallback textuel si la livraison interactive est indisponible.
+L’identité qui lie `job_id`, numéro d’offre et message Discord est maintenant conservée par `plugin_db`; le même registre sert à vérifier le clic sans dépendre seulement du texte du footer. La revendication de l’action est persistée avant le defer Discord. Les interactions Discord ne sont pas une file d’attente durable pour les décisions métier : si l’injection Hermes échoue avant confirmation, le claim en attente est libéré quand la suppression SQLite aboutit. Garder un fallback textuel si la livraison interactive est indisponible.
 
 ### 2. Séparer le parseur du rendu Discord
 
