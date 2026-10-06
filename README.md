@@ -39,7 +39,7 @@ button: it opens a modal whose text is submitted to Hermes alongside the offer (
 ## Install
 
 ```bash
-git clone <this repo> ~/.hermes/plugins/hermes-discord-plugin
+git clone https://github.com/rogafe/hermes-discord-plugin.git ~/.hermes/plugins/hermes-discord-plugin
 hermes plugins enable hermes-discord-plugin
 ```
 
