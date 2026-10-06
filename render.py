@@ -5,6 +5,7 @@ Embeds are built as Discord API dicts and converted with ``discord.Embed.from_di
 from __future__ import annotations
 
 from typing import Any, Optional
+import re
 
 DEFAULT_COLOR = 0x5865F2  # Discord blurple
 DEFAULT_FOOTER_TEMPLATE = "{model}"
@@ -12,6 +13,7 @@ DEFAULT_FOOTER_TEMPLATE = "{model}"
 # Discord limits (https://docs.discord.com/developers/resources/message#embed-object-embed-limits).
 EMBED_DESCRIPTION_LIMIT = 4096
 EMBED_FOOTER_LIMIT = 2048
+EMBED_TOTAL_LIMIT = 6000
 
 
 def model_short(model: Optional[str]) -> str:
@@ -52,4 +54,45 @@ def build_embed_dict(description: str, *, color: int, footer: str = "") -> dict:
     embed: dict = {"type": "rich", "description": description[:EMBED_DESCRIPTION_LIMIT], "color": color}
     if footer:
         embed["footer"] = {"text": footer}
+    return embed
+
+
+def build_offer_embed_dict(
+    title: str, body: str, *, color: int, number: int, footer: str = "",
+) -> dict:
+    """Build a compact job-offer card from one numbered Cronjob Response block."""
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    location = deadline = targeting = ""
+    for index, line in enumerate(lines):
+        match = re.search(r"📍\s*(.*?)\s*\|\s*📅\s*(.*?)\s*\|\s*🎯\s*(.*)", line)
+        if match:
+            location, deadline, targeting = (part.strip() for part in match.groups())
+            del lines[index]
+            break
+
+    url = next((line.strip("<> ") for line in lines if re.match(r"https?://\S+", line)), "")
+    lines = [line for line in lines if not re.match(r"https?://\S+", line)]
+    description = "\n".join(lines).strip()
+    embed: dict = {
+        "type": "rich",
+        "title": title.strip()[:256],
+        "description": description or "Offre détectée par la veille emploi.",
+        "color": color,
+    }
+    if url:
+        embed["url"] = url[:2048]
+    fields = []
+    for name, value in (("📍 Localisation", location), ("📅 Échéance", deadline), ("🎯 Ciblage", targeting)):
+        if value:
+            fields.append({"name": name, "value": value[:1024], "inline": name != "🎯 Ciblage"})
+    if fields:
+        embed["fields"] = fields
+    card_footer = (f"Offre {number}" + (f" · {footer}" if footer else ""))[:EMBED_FOOTER_LIMIT]
+    field_chars = sum(len(field["name"]) + len(field["value"]) for field in fields)
+    available_description = max(
+        0,
+        EMBED_TOTAL_LIMIT - len(embed["title"]) - field_chars - len(card_footer),
+    )
+    embed["description"] = description[:min(EMBED_DESCRIPTION_LIMIT, available_description)]
+    embed["footer"] = {"text": card_footer}
     return embed

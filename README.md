@@ -12,6 +12,11 @@ model that answered in the embed footer:
 Tool progress, typing indicators, approval prompts and other intermediate messages are left alone; only the
 final reply of each turn is converted.
 
+Numbered offers in a final `Cronjob Response` are sent as separate embed cards. Each card shows the offer
+title, location, deadline, targeting, and application link, with **Ignorer**, **Suivre**, and **Postuler**
+buttons. Clicking one submits the equivalent `N 🗑️`, `N 👀`, or `N 📝` choice to the current Hermes Discord
+conversation, so the cron workflow can read it as a user decision.
+
 ## Install
 
 ```bash
@@ -37,6 +42,8 @@ plugins:
         footer_template: "{model}"      # {model} = "claude-opus-5-5", {model_full} = "anthropic/claude-opus-5-5"
         color: "#5865F2"                # embed bar color
         embed_non_model_replies: false  # true = also embed slash-command output (no footer)
+        cron_offer_interactions: true   # split numbered Cronjob Response offers into interactive cards
+        cron_offer_buttons: true        # route button choices back into Hermes
 ```
 
 Leave Hermes' own text footer (`display.runtime_footer`) off, or its line will show up inside the embed too.
@@ -54,6 +61,13 @@ Hermes has no hook for changing how a reply is sent, so the plugin uses two supp
    been delivered, the plugin edits those messages in place into embeds, putting the model in the footer
    of the last one.
 
+For a final cron message that starts with `Cronjob Response:` and includes a `job_id`, the wrapper recognizes
+numbered offer headings (`**[N] Title**`), sends the report introduction, each offer, and the report summary
+as separate messages through the original adapter, then edits each into an embed. Offer button clicks are
+authorized with Hermes' Discord component allowlist/pairing check and become normal text events in that
+channel or thread. Button custom IDs carry only the job ID, offer number, and action; no offer text is sent
+back in the interaction payload.
+
 Any failure leaves the plain-text reply as it was.
 
 ### Known limitations
@@ -61,6 +75,11 @@ Any failure leaves the plain-text reply as it was.
 - The reply appears as plain text for a moment before becoming an embed (one extra edit per message).
 - Long replies keep Hermes' 2000-character chunking: one embed per chunk, footer on the last.
 - Replies in **forum** channels (which create a new post) stay plain text.
+- Interactive offer cards require a current Hermes Discord adapter exposing `handle_message` and `build_source`,
+  plus its component authorization helper. If that inbound seam is unavailable, the plugin leaves the buttons
+  off rather than showing controls that cannot submit a choice.
+- Offer splitting recognizes the numbered `Cronjob Response` format. Other cron output keeps the regular
+  single-reply rendering path.
 
 ## Tests
 

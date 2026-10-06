@@ -1,8 +1,8 @@
 name: hermes-discord-plugin
-version: 0.1.0
+version: 0.2.0
 manifest_version: 2
 api_version: 1
-description: "Render Hermes Agent's Discord replies as embeds, with the model name in the footer."
+description: "Render Discord replies as embeds and add interactive cards to numbered cron offers."
 author: rogafe
 kind: standalone
 platforms: [linux, macos, windows]
@@ -34,3 +34,13 @@ config_schema:
     default: false
     label: "Embed non-model replies"
     description: "Also render final replies that no model produced (slash-command output, errors) as embeds, without a footer."
+  cron_offer_interactions:
+    type: bool
+    default: true
+    label: "Interactive cron offer cards"
+    description: "Split numbered offers in Cronjob Response messages into embed cards with Ignore, Follow and Apply buttons."
+  cron_offer_buttons:
+    type: bool
+    default: true
+    label: "Cron offer action buttons"
+    description: "Add buttons that send the selected offer action back to the current Hermes Discord conversation."
