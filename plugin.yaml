@@ -44,6 +44,11 @@ config_schema:
     default: true
     label: "Cron offer action buttons"
     description: "Add buttons that send the selected offer action back to the current Hermes Discord conversation."
+  cron_offer_notes:
+    type: bool
+    default: true
+    label: "Cron offer note modal"
+    description: "Add a Remarque button to each offer card that opens a modal and forwards the typed note to Hermes alongside the offer."
   cron_report_pagination:
     type: bool
     default: true

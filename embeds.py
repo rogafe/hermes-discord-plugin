@@ -33,6 +33,7 @@ class _AdapterState:
         self.listener_bots: set[int] = set()
         self.interaction_router = InteractionRouter()
         self.interaction_router.register("hermes_offer|", _handle_offer_button)
+        self.interaction_router.register("hermes_note_modal|", _handle_note_modal)
         self.interaction_router.register("hermes_pager|", _handle_pager_button)
         self.offer_store = OfferStateStore()
         self.page_store = PageStore()
@@ -353,7 +354,9 @@ async def _decorate_cron_segments(
             stored = state.offer_store.register_card(
                 str(message.id), str(channel.id), segment.offer.job_id, segment.offer.number,
             ) if buttons_enabled and interaction_ready else False
-            view = _offer_view(segment.offer) if buttons_enabled and interaction_ready and stored else None
+            view = _offer_view(segment.offer, with_note=_setting_bool(
+                state.get_setting, "cron_offer_notes", True,
+            )) if buttons_enabled and interaction_ready and stored else None
             if buttons_enabled and interaction_ready and not stored:
                 logger.warning("hermes-discord-plugin: cron offer buttons omitted: card identity could not be stored")
             try:
@@ -374,7 +377,7 @@ async def _decorate_cron_segments(
                 logger.warning("hermes-discord-plugin: could not render report message %s: %s", message_id, exc)
 
 
-def _offer_view(offer: Offer):
+def _offer_view(offer: Offer, *, with_note: bool = True):
     import discord
 
     if len(offer.job_id) > 72:
@@ -394,6 +397,13 @@ def _offer_view(offer: Offer):
         # when discord.py no longer has this transient View instance in its view store.
         button.callback = _ignore_view_callback
         view.add_item(button)
+    if with_note:
+        note_button = discord.ui.Button(
+            label="Remarque", emoji="🗒️", style=discord.ButtonStyle.secondary,
+            custom_id=f"hermes_offer|{offer.job_id}|{offer.number}|note",
+        )
+        note_button.callback = _ignore_view_callback
+        view.add_item(note_button)
     return view
 
 
@@ -404,7 +414,7 @@ async def _ignore_view_callback(_interaction: Any) -> None:
 async def _handle_offer_button(interaction: Any) -> None:
     """Authenticate the click, acknowledge it, then inject the choice as a Hermes user event."""
     custom_id = (getattr(interaction, "data", None) or {}).get("custom_id", "")
-    match = re.fullmatch(r"hermes_offer\|([A-Za-z0-9_-]{1,72})\|(\d{1,3})\|(ignore|follow|apply)", custom_id)
+    match = re.fullmatch(r"hermes_offer\|([A-Za-z0-9_-]{1,72})\|(\d{1,3})\|(ignore|follow|apply|note)", custom_id)
     if not match:
         await _respond_ephemeral(interaction, "Ce bouton d’offre n’est plus valide.")
         return
@@ -427,6 +437,9 @@ async def _handle_offer_button(interaction: Any) -> None:
     message = getattr(interaction, "message", None)
     if not _interaction_matches_card(state, interaction, message, number, job_id):
         await _respond_ephemeral(interaction, "Ce bouton ne correspond plus à une carte d’offre valide.")
+        return
+    if action == "note":
+        await _open_note_modal(state, interaction, job_id, number)
         return
     emoji, label = {
         "ignore": ("🗑️", "Ignorer"),
@@ -463,6 +476,127 @@ async def _handle_offer_button(interaction: Any) -> None:
                 await interaction.response.send_message("Le clic n’a pas pu être transmis à Hermes.", ephemeral=True)
         except Exception:
             pass
+
+
+async def _open_note_modal(state: _AdapterState, interaction: Any, job_id: str, number: str) -> None:
+    """Open the Remarque modal as the *initial* response: authorization and card identity
+    are checked first because a modal cannot be preceded by a defer/acknowledgement."""
+    import discord
+
+    if not (
+        _setting_bool(state.get_setting, "enabled", True)
+        and _setting_bool(state.get_setting, "cron_offer_interactions", True)
+        and _setting_bool(state.get_setting, "cron_offer_buttons", True)
+        and _setting_bool(state.get_setting, "cron_offer_notes", True)
+    ):
+        await _respond_ephemeral(interaction, "Les remarques sur les offres sont désactivées.")
+        return
+    # No claim yet: a note must never consume the single ignore/follow/apply slot.
+    # The one-note-per-card dedupe happens at modal-submit time (see _handle_note_modal).
+    modal = discord.ui.Modal(
+        title=f"Remarque · offre {number}",
+        custom_id=f"hermes_note_modal|{job_id}|{number}",
+    )
+    modal.add_item(discord.ui.TextInput(
+        label="Note à transmettre à Hermes",
+        style=discord.TextStyle.paragraph,
+        custom_id="note_text",
+        required=True,
+        max_length=1000,
+    ))
+    try:
+        await interaction.response.send_modal(modal)
+    except Exception:
+        logger.warning("hermes-discord-plugin: could not open offer note modal", exc_info=True)
+        # send_modal failed before any acknowledgement, so a plain ephemeral reply is still allowed.
+        await _respond_ephemeral(interaction, "La fenêtre de remarque n’a pas pu être ouverte.")
+
+
+async def _handle_note_modal(interaction: Any) -> None:
+    """Authenticate the modal submit, re-validate it against the persistent card
+    identity, deduplicate, then inject the note alongside the offer into Hermes."""
+    custom_id = (getattr(interaction, "data", None) or {}).get("custom_id", "")
+    match = re.fullmatch(r"hermes_note_modal\|([A-Za-z0-9_-]{1,72})\|(\d{1,3})", custom_id)
+    if not match:
+        await _respond_ephemeral(interaction, "Ce formulaire n’est plus valide.")
+        return
+    job_id, number = match.groups()
+    note_text = _modal_text_value(interaction, "note_text")
+    if not note_text:
+        await _respond_ephemeral(interaction, "La remarque est vide.")
+        return
+    state = _find_state_for_interaction(interaction)
+    if state is None:
+        await _respond_ephemeral(interaction, "Cette action n’est plus disponible.")
+        return
+    if not (
+        _setting_bool(state.get_setting, "enabled", True)
+        and _setting_bool(state.get_setting, "cron_offer_interactions", True)
+        and _setting_bool(state.get_setting, "cron_offer_buttons", True)
+        and _setting_bool(state.get_setting, "cron_offer_notes", True)
+    ):
+        await _respond_ephemeral(interaction, "Les remarques sur les offres sont désactivées.")
+        return
+    if not await _authorized_component(state.adapter, interaction):
+        await _respond_ephemeral(interaction, "Tu n’es pas autorisé à utiliser ce formulaire.")
+        return
+
+    message = getattr(interaction, "message", None)
+    if not _interaction_matches_card(state, interaction, message, number, job_id):
+        await _respond_ephemeral(interaction, "Ce formulaire ne correspond plus à une carte d’offre valide.")
+        return
+    message_id = str(getattr(message, "id", ""))
+    user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+    if not state.offer_store.save_note(message_id, job_id, int(number), user_id):
+        await _respond_ephemeral(interaction, "Une remarque a déjà été envoyée pour cette carte.")
+        return
+
+    committed = False
+    try:
+        await interaction.response.defer(ephemeral=True)
+        await _inject_choice(
+            state.adapter, interaction,
+            f"{number} 🗒️ Remarque (job_id: {job_id}) : {note_text}",
+        )
+        committed = True
+        await interaction.followup.send(
+            f"Remarque transmise à Hermes pour l’offre {number}.", ephemeral=True,
+        )
+    except Exception as exc:
+        if not committed:
+            state.offer_store.remove_note(message_id, job_id, int(number))
+        logger.warning("hermes-discord-plugin: could not route offer note: %s", exc)
+        try:
+            if getattr(interaction.response, "is_done", lambda: False)():
+                await interaction.followup.send("La remarque n’a pas pu être transmise à Hermes.", ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    "La remarque n’a pas pu être transmise à Hermes.", ephemeral=True,
+                )
+        except Exception:
+            pass
+
+
+def _modal_text_value(interaction: Any, component_custom_id: str) -> str:
+    """Extract a text-input value from a MODAL_SUBMIT payload across discord.py shapes."""
+    components = (getattr(interaction, "data", None) or {}).get("components") or []
+    for row in components:
+        fields = (
+            getattr(row, "children", None)
+            or getattr(row, "components", None)
+            or (row if isinstance(row, list) else [])
+        )
+        for field in fields:
+            if getattr(field, "custom_id", None) == component_custom_id:
+                text = str(getattr(field, "value", "") or "").strip()
+                if text:
+                    return text
+            if isinstance(field, dict):
+                if field.get("custom_id") == component_custom_id:
+                    text = str(field.get("value", "") or "").strip()
+                    if text:
+                        return text
+    return ""
 
 
 async def _respond_ephemeral(interaction: Any, content: str) -> None:

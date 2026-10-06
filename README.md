@@ -15,7 +15,9 @@ final reply of each turn is converted.
 Numbered offers in a final `Cronjob Response` are sent as separate embed cards. Each card shows the offer
 title, location, deadline, targeting, and application link, with **Ignorer**, **Suivre**, and **Postuler**
 buttons. Clicking one submits the equivalent `N 🗑️`, `N 👀`, or `N 📝` choice to the current Hermes Discord
-conversation, so the cron workflow can read it as a user decision.
+conversation, so the cron workflow can read it as a user decision. Each card can also carry a **Remarque**
+button: it opens a modal whose text is submitted to Hermes alongside the offer (`N 🗒️ Remarque (job_id: …) :
+…`), so a decision can arrive with context in a single turn. One note per card, deduplicated like the actions.
 
 ## Install
 
@@ -44,6 +46,7 @@ plugins:
         embed_non_model_replies: false  # true = also embed slash-command output (no footer)
         cron_offer_interactions: true   # split numbered Cronjob Response offers into interactive cards
         cron_offer_buttons: true        # route button choices back into Hermes
+        cron_offer_notes: true          # add a Remarque button/modal to collect a note per offer card
         cron_report_pagination: true    # large cron reports become page embeds instead of dozens of cards
         cron_report_pagination_threshold: 8  # offers needed before pagination kicks in (0 = never paginate)
 ```
@@ -72,10 +75,12 @@ back in the interaction payload. An offer too long for one interactive card stay
 report segment; the remaining offers keep their buttons.
 
 Offer-card identities and one-action-per-card claims use Hermes' profile-scoped SQLite plugin store, so
-duplicate clicks remain blocked after a gateway restart. Older Hermes versions without that storage API
-fall back to process-local state.
+duplicate clicks remain blocked after a gateway restart. Notes submitted through the Remarque modal are
+deduplicated the same way (one note per card), and the modal itself is only delivered after the same
+component authorization check and card-identity validation as the action buttons. Older Hermes versions
+without that storage API fall back to process-local state.
 
-When a report carries more than `cron_report_pagination_threshold` offers, it is delivered as a small number
+When a report carries at least `cron_report_pagination_threshold` offers, it is delivered as a small number
 of page embeds (packaged under the Discord 2000-character message limit) with persistent ◀/▶ pager buttons
 instead of dozens of per-offer cards. Page content is persisted with the same plugin store, keyed by Discord
 message ID and validated against the channel and job ID on click, so pager buttons keep working after a
@@ -103,8 +108,8 @@ Any failure leaves the plain-text reply as it was.
   off rather than showing controls that cannot submit a choice.
 - Offer splitting recognizes the numbered `Cronjob Response` format. Other cron output keeps the regular
   single-reply rendering path.
-- Paginated reports replace the per-offer action buttons with page navigation; the offers are still fully
-  readable, but a choice must be sent as text from that chat.
+- Paginated reports replace the per-offer action and note buttons with page navigation; the offers are still
+  fully readable, but choices and remarks must be sent as text from that chat.
 
 ## Tests
 

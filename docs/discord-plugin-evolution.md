@@ -14,7 +14,8 @@ Le plugin est un adaptateur local `discord.py` : il mémorise le modèle via `po
 - **Fait** : stockage SQLite profilé des cartes et des actions, avec unicité par message/offre et fallback mémoire si l’API Hermes n’est pas présente.
 - **Fait** : routeur d'interactions général par préfixe `custom_id`, avec priorité au préfixe le plus précis et attachement idempotent au Gateway.
 - **Fait** : pagination des gros rapports d'offres (`cron_report_pagination`) : au-delà du seuil configuré, le rapport est envoyé en pages d'embeds (paquetées sous la limite message de 2 000 caractères) avec boutons persistants ◀/▶ et indicateur de page; l'acheminement passe par le routeur générique (`hermes_pager|`), la vérification d'autorisation Hermes et `plugin_db` pour survivre aux redémarrages; repli automatique sur les cartes par offre si la route d'interaction, le stockage ou l'autorisation manque.
-- **À faire** : menus de sélection, modals, commandes slash/contextuelles, réglages visuels par conversation et dispatch embed natif. Ordre recommandé : menus seulement pour les listes longues; commandes après validation du dispatch Hermes.
+- **Fait** : modal « Remarque » sur chaque carte d'offre non paginée; le texte est validé et envoyé comme événement séparé, protégé par l'autorisation Hermes et une déduplication persistante par carte.
+- **À faire** : menus de sélection, commandes slash/contextuelles, réglages visuels par conversation et dispatch embed natif. Ordre recommandé : menus seulement pour les listes longues; commandes après validation du dispatch Hermes.
 
 ## Capacités Discord utiles
 
@@ -52,7 +53,7 @@ Ajouter des thèmes/configurations par conversation, langue et densité; rendre 
 ## Priorités et critères d’acceptation
 
 1. **P0 — robustesse des offres** : test des formats incomplets et des messages multipart; clic accepté/refusé; action acquittée en moins de 3 s; clic répété sans effet métier doublé; action routée vers le bon thread; reprise après redémarrage avec confirmation éditée ou état expiré clairement signalé.
-2. **P1 — interaction générique** : sélecteur/modal avec réponse éphémère; pagination; tests de limites d’embed et de composants; aucune action interactive affichée quand le routeur entrant est indisponible.
+2. **P1 — interaction générique** : sélecteur si de longues listes le justifient; pagination; validation continue des limites d’embed et de composants; aucune action interactive affichée quand le routeur entrant est indisponible.
 3. **P2 — contrôle Hermes depuis Discord** : commandes de statut, cron et gestion de conversation, installables d’abord à l’échelle d’un serveur de test.
 
 Les limites Discord changent avec l’API. Le plugin devrait s’appuyer sur les constantes et validations de `discord.py`, documenter la version d’API et traiter proprement les erreurs HTTP, plutôt que dupliquer des nombres dispersés dans le code.

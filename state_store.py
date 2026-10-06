@@ -17,6 +17,7 @@ class OfferStateStore:
     def __init__(self) -> None:
         self._memory_cards: dict[str, tuple[str, str, int]] = {}
         self._memory_claims: dict[tuple[str, str, int], str] = {}
+        self._memory_notes: dict[tuple[str, str, int], str] = {}
         self._storage_supported: Optional[bool] = None
 
     def register_card(self, message_id: str, channel_id: str, job_id: str, offer_number: int) -> bool:
@@ -99,6 +100,54 @@ class OfferStateStore:
                 logger.warning("hermes-discord-plugin: could not write offer-action claim", exc_info=True)
                 return False
 
+    def save_note(
+        self, message_id: str, job_id: str, offer_number: int, user_id: str,
+    ) -> bool:
+        """Atomically reserve the single note slot of an offer card (idempotent modal submits)."""
+        key = (str(message_id), str(job_id), int(offer_number))
+        with _DATABASE_LOCK:
+            try:
+                connection = self._connection()
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not persist offer note", exc_info=True)
+                return False
+            if connection is None:
+                if key in self._memory_notes:
+                    return False
+                self._memory_notes[key] = str(user_id)
+                return True
+            try:
+                self._ensure_schema(connection)
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO hermes_discord_offer_notes "
+                    "(message_id, job_id, offer_number, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (*key, str(user_id), int(time.time())),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not write offer note", exc_info=True)
+                return False
+
+    def remove_note(self, message_id: str, job_id: str, offer_number: int) -> None:
+        """Release the note slot after a failed injection so the user can retry."""
+        key = (str(message_id), str(job_id), int(offer_number))
+        with _DATABASE_LOCK:
+            try:
+                connection = self._connection()
+                if connection is None:
+                    self._memory_notes.pop(key, None)
+                    return
+                self._ensure_schema(connection)
+                connection.execute(
+                    "DELETE FROM hermes_discord_offer_notes "
+                    "WHERE message_id = ? AND job_id = ? AND offer_number = ?",
+                    key,
+                )
+                connection.commit()
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not release offer note", exc_info=True)
+
     def commit_claim(self, message_id: str, job_id: str, offer_number: int, interaction_id: str) -> None:
         with _DATABASE_LOCK:
             try:
@@ -158,4 +207,10 @@ class OfferStateStore:
             "interaction_id TEXT NOT NULL, action TEXT NOT NULL, user_id TEXT NOT NULL, "
             "state TEXT NOT NULL, claimed_at INTEGER NOT NULL, "
             "PRIMARY KEY (message_id, job_id, offer_number), UNIQUE (interaction_id))"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS hermes_discord_offer_notes ("
+            "message_id TEXT NOT NULL, job_id TEXT NOT NULL, offer_number INTEGER NOT NULL, "
+            "user_id TEXT NOT NULL, created_at INTEGER NOT NULL, "
+            "PRIMARY KEY (message_id, job_id, offer_number))"
         )
