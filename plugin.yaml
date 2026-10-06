@@ -34,6 +34,11 @@ config_schema:
     default: false
     label: "Embed non-model replies"
     description: "Also render final replies that no model produced (slash-command output, errors) as embeds, without a footer."
+  long_reply_chunking:
+    type: bool
+    default: true
+    label: "Clean chunking of long replies"
+    description: "Split long final replies on paragraph, line, sentence and word boundaries (never inside code fences, links or bold/italic/code spans) before Hermes would cut them at 2000 characters."
   cron_offer_interactions:
     type: bool
     default: true

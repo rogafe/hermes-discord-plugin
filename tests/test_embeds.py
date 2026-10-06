@@ -149,7 +149,7 @@ def test_reply_without_model_embedded_when_opted_in(env):
 
 def test_chunked_reply_footer_only_on_last(env):
     setup, channel, tracker = env
-    adapter = setup()
+    adapter = setup(long_reply_chunking=False)  # exercise the adapter's own 2000-char split
     tracker.record((str(CHANNEL_ID),), "gpt-5.4")
     result = run(adapter.send(str(CHANNEL_ID), "a" * 2000 + "b" * 500, metadata={"notify": True}))
     first, last = (channel.messages[int(i)] for i in result.raw_response["message_ids"])
@@ -254,3 +254,45 @@ def test_register_end_to_end(plugin, monkeypatch):
     ctx.hooks["post_llm_call"](model="openai/gpt-5.4", platform="discord", session_id="s")
     result = run(adapter.send(str(CHANNEL_ID), "answer", metadata={"notify": True}))
     assert channel.messages[int(result.message_id)].embeds[0].footer.text == "gpt-5.4"
+
+
+def _long_reply():
+    paragraph = "Jour un : visite de la vieille ville, **marché central** et [le musée](https://example.com/m). "
+    return "\n\n".join(paragraph * 6 for _ in range(6))
+
+
+def test_long_reply_is_chunked_on_paragraphs_without_loss(env):
+    setup, channel, tracker = env
+    adapter = setup()
+    tracker.record((str(CHANNEL_ID),), "gpt-5.4")
+    text = _long_reply()
+    result = run(adapter.send(str(CHANNEL_ID), text, metadata={"notify": True}))
+    ids = result.raw_response["message_ids"]
+    assert result.message_id == ids[0] and len(ids) > 1
+    messages = [channel.messages[int(i)] for i in ids]
+    assert all(m.embeds and m.content == "" for m in messages)
+    descriptions = [m.embeds[0].description for m in messages]
+    assert "".join(descriptions).replace("\n", "") == text.replace("\n", "")
+    assert all(d.rstrip().endswith(("。", ".", "**", ")", " ")) or d.rstrip().endswith("m).") for d in descriptions)
+    assert all(d.count("[") == d.count("]") for d in descriptions)
+    assert messages[0].embeds[0].title == "Partie 1/%d" % len(ids)
+    assert messages[-1].embeds[0].footer.text == "gpt-5.4"
+
+
+def test_long_reply_chunking_can_be_disabled(env):
+    setup, channel, tracker = env
+    adapter = setup(long_reply_chunking=False)
+    tracker.record((str(CHANNEL_ID),), "m")
+    text = "word " * 500
+    result = run(adapter.send(str(CHANNEL_ID), text, metadata={"notify": True}))
+    first = channel.messages[int(result.raw_response["message_ids"][0])]
+    assert first.content == "" and len(first.embeds[0].description) <= 2000
+
+
+def test_long_reply_over_adapter_cap_falls_back(env):
+    setup, channel, _tracker = env
+    adapter = setup()
+    adapter.MAX_SPLIT_MESSAGES = 2
+    _tracker.record((str(CHANNEL_ID),), "m")
+    result = run(adapter.send(str(CHANNEL_ID), "word " * 1500, metadata={"notify": True}))
+    assert len(result.raw_response["message_ids"]) == 4  # adapter's own splitting, untouched

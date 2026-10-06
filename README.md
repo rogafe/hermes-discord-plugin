@@ -67,6 +67,7 @@ plugins:
         cron_pending_command: true      # register /cron-pending (list unclaimed offer cards); restart to apply
         cron_report_pagination: true    # large cron reports become page embeds instead of dozens of cards
         cron_report_pagination_threshold: 8  # offers needed before pagination kicks in (0 = never paginate)
+        long_reply_chunking: true  # split long final replies on clean Markdown boundaries before Hermes does
 ```
 
 Leave Hermes' own text footer (`display.runtime_footer`) off, or its line will show up inside the embed too.
@@ -135,9 +136,13 @@ Any failure leaves the plain-text reply as it was.
 ### Known limitations
 
 - The reply appears as plain text for a moment before becoming an embed (one extra edit per message).
-- Long ordinary replies still use Hermes' own 2000-character chunking. The plugin labels each resulting
-  embed as a continuation but cannot change where Hermes split the source text, so a boundary may still
-  fall inside a sentence or Markdown construct.
+- Long ordinary final replies are pre-split by the plugin (`long_reply_chunking`) on paragraph, line, sentence
+  and word boundaries, never inside a fenced code block (a block longer than one message is closed and reopened
+  with the same language tag), a `[text](url)` link, or an inline bold/italic/code/strikethrough span. Each
+  fragment is at most 1900 characters because it still travels as a plain message of at most 2000 characters
+  that is then edited into an embed, so embeds are not packed up to Discord's 4096-character description limit.
+  Replies that would need more than the adapter's flood cap (`MAX_SPLIT_MESSAGES`, 8) and forum posts are left
+  to Hermes' own splitting; so are non-final messages and streamed (edited) replies.
 - Replies in **forum** channels (which create a new post) stay plain text.
 - Interactive offer cards require a current Hermes Discord adapter exposing `handle_message` and `build_source`,
   plus its component authorization helper. If that inbound seam is unavailable, the plugin leaves the buttons
