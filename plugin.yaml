@@ -1,5 +1,5 @@
 name: hermes-discord-plugin
-version: 0.2.0
+version: 0.3.0
 manifest_version: 2
 api_version: 1
 description: "Render Discord replies as embeds and add interactive cards to numbered cron offers."
@@ -34,6 +34,11 @@ config_schema:
     default: false
     label: "Embed non-model replies"
     description: "Also render final replies that no model produced (slash-command output, errors) as embeds, without a footer."
+  long_reply_chunking:
+    type: bool
+    default: true
+    label: "Clean chunking of long replies"
+    description: "Split long final replies on paragraph, line, sentence and word boundaries (never inside code fences, links or bold/italic/code spans) before Hermes would cut them at 2000 characters."
   cron_offer_interactions:
     type: bool
     default: true
@@ -54,6 +59,11 @@ config_schema:
     default: true
     label: "Cron pending slash command"
     description: "Register the /cron-pending slash command, which lists unclaimed offer cards in the current conversation. Registration happens once, so toggling needs a gateway restart."
+  cron_recover_command:
+    type: bool
+    default: true
+    label: "Cron recover slash command"
+    description: "Register the /cron-recover slash command, which frees offer actions and notes interrupted by a gateway stop. The outcome of those deliveries is unknown, so the command warns about possible duplicates. Registration happens once, so toggling needs a gateway restart."
   cron_report_pagination:
     type: bool
     default: true

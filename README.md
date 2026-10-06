@@ -65,8 +65,10 @@ plugins:
         cron_offer_buttons: true        # route button choices back into Hermes
         cron_offer_notes: true          # add a Remarque button/modal to collect a note per offer card
         cron_pending_command: true      # register /cron-pending (list unclaimed offer cards); restart to apply
+        cron_recover_command: true      # register /cron-recover (release interrupted offer actions/notes); restart to apply
         cron_report_pagination: true    # large cron reports become page embeds instead of dozens of cards
         cron_report_pagination_threshold: 8  # offers needed before pagination kicks in (0 = never paginate)
+        long_reply_chunking: true  # split long final replies on clean Markdown boundaries before Hermes does
 ```
 
 Leave Hermes' own text footer (`display.runtime_footer`) off, or its line will show up inside the embed too.
@@ -88,6 +90,19 @@ job id, pending-note flag), reading the durable `plugin_db` card registry — us
 deleted, a gateway restart, or when you just want the numbers again. Commands are registered globally
 by Hermes (no per-guild sync seam) and, like all plugin commands, are dropped first if Hermes hits
 Discord's 100-command cap.
+
+A second command, **`/cron-recover`** (toggle: `cron_recover_command`, same registration caveats),
+handles clicks that were interrupted before reaching a terminal state. Clicking an offer button
+reserves the card's action slot *before* the choice is dispatched to Hermes, so a gateway crash
+between the two steps leaves the row pending forever: the card keeps reporting "already sent" even
+though the choice may never have been delivered. The plugin does **not** claim exactly-once delivery
+across its SQLite store and Hermes dispatch — it cannot prove what happened when a process died
+mid-dispatch. So instead of silently releasing (risking a duplicate decision) or silently blocking
+(silent loss), a blocked click says exactly that: either the choice arrived before the stop or it
+did not, and `/cron-recover` (or a manual `N 👀 (job_id: …)` text reply) frees the slot after naming
+each offer and warning the outcome is unknown. Rows pending less than 10 minutes are treated as a
+dispatch still in flight, not as interrupted. The Remarque modal has the same window and the same
+recovery path.
 
 ## How it works
 
@@ -120,7 +135,11 @@ When a report carries at least `cron_report_pagination_threshold` offers, it is 
 of page embeds (packaged under the Discord 2000-character message limit) with persistent ◀/▶ pager buttons
 instead of dozens of per-offer cards. Page content is persisted with the same plugin store, keyed by Discord
 message ID and validated against the channel and job ID on click, so pager buttons keep working after a
-restart; every page turn still goes through the Hermes component authorization check. If the interaction
+restart; every page turn still goes through the Hermes component authorization check. The durable pager
+state is bounded: pages older than 7 days, and rows beyond the 200 most recent reports, are pruned when
+the next paginated report is sent (the `forget()` drop stays the explicit per-report API). A page whose
+state was pruned simply reports that it is no longer available; active, recently delivered pagers keep
+their buttons across restarts. If the interaction
 route, storage, authorization, or embedding seam is unavailable, the report falls back to the plain
 per-offer cards (or plain text) without losing content.
 
@@ -135,9 +154,13 @@ Any failure leaves the plain-text reply as it was.
 ### Known limitations
 
 - The reply appears as plain text for a moment before becoming an embed (one extra edit per message).
-- Long ordinary replies still use Hermes' own 2000-character chunking. The plugin labels each resulting
-  embed as a continuation but cannot change where Hermes split the source text, so a boundary may still
-  fall inside a sentence or Markdown construct.
+- Long ordinary final replies are pre-split by the plugin (`long_reply_chunking`) on paragraph, line, sentence
+  and word boundaries, never inside a fenced code block (a block longer than one message is closed and reopened
+  with the same language tag), a `[text](url)` link, or an inline bold/italic/code/strikethrough span. Each
+  fragment is at most 1900 characters because it still travels as a plain message of at most 2000 characters
+  that is then edited into an embed, so embeds are not packed up to Discord's 4096-character description limit.
+  Replies that would need more than the adapter's flood cap (`MAX_SPLIT_MESSAGES`, 8) and forum posts are left
+  to Hermes' own splitting; so are non-final messages and streamed (edited) replies.
 - Replies in **forum** channels (which create a new post) stay plain text.
 - Interactive offer cards require a current Hermes Discord adapter exposing `handle_message` and `build_source`,
   plus its component authorization helper. If that inbound seam is unavailable, the plugin leaves the buttons
