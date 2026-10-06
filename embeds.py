@@ -107,9 +107,12 @@ async def _send_cron_offer_segments(
     if pg_enabled and should_paginate(document, pg_threshold):
         pages = build_report_pages(document)
         if pages is not None:
-            return await _send_paginated_report(
+            paginated_result = await _send_paginated_report(
                 state, original_send, chat_id, document, pages, reply_to, metadata, model,
             )
+            if paginated_result is not None:
+                return paginated_result
+            logger.warning("hermes-discord-plugin: pager channel unavailable; falling back to offer cards")
         logger.info(
             "hermes-discord-plugin: pagination skipped (report does not split within embed limits)"
         )

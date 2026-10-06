@@ -21,7 +21,7 @@ class PageStore:
     """Store one packed page list per Discord message that carries a pager."""
 
     def __init__(self) -> None:
-        self._memory_pages: dict[str, tuple[str, str, list[str]]] = {}
+        self._memory_pages: dict[str, tuple[str, str, list[str], str]] = {}
         self._storage_supported: Optional[bool] = None
 
     def save(self, message_id: str, channel_id: str, job_id: str, pages: list[str], footer: str = "") -> bool:
@@ -54,7 +54,6 @@ class PageStore:
 
     def load(self, message_id: str, channel_id: str, job_id: str) -> Optional[tuple[list[str], str]]:
         """Return the stored pages and model footer only when the click context matches."""
-        """Return the stored pages only when the channel and job match the click context."""
         with _DATABASE_LOCK:
             try:
                 connection = self._connection()
@@ -75,7 +74,10 @@ class PageStore:
                 ).fetchone()
                 if row is None or row[0] != str(channel_id) or row[1] != str(job_id):
                     return None
-                return _decode_pages(row[2]), str(row[3] or "")
+                pages = _decode_pages(row[2])
+                if pages is None:
+                    return None
+                return pages, str(row[3] or "")
             except Exception:
                 logger.warning("hermes-discord-plugin: could not read pagination state", exc_info=True)
                 return None
