@@ -53,6 +53,8 @@ Le rendu natif en une seule opération reste bloqué par le contrat actuel de l'
 
 Ajouter des thèmes/configurations par conversation, langue et densité; rendre uniformes les titres, champs, liens, statuts, timestamps et mentions. Prévoir une limite configurable d’items par carte/message, un résumé et une pagination pour les résultats abondants. Ajouter un mode diagnostic qui indique dans les logs pourquoi une carte ou ses composants n’ont pas été ajoutés, sans journaliser jetons, contenu privé ou données sensibles. Exposer des réglages indépendants pour embeds, cartes d’offres, boutons, slash commands et boutons de confirmation.
 
+**Point manqué par l'audit initial :** le README signalait déjà que les messages intermédiaires n'étaient pas touchés, mais la progression verbeuse visible dans Discord n'avait pas été relevée comme problème ni reliée aux réglages Hermes. Cette progression précède le rendu final et est pilotée par `display.platforms.discord`, pas par le plugin. Pour un flux silencieux qui conserve les détails en log, Hermes expose `tool_progress: log`, `interim_assistant_messages: false`, `show_reasoning: false`, `busy_ack_detail: false` et `long_running_notifications: false`. Vérifier ce réglage dans un thread de recherche ponctuelle (par exemple un voyage) et dans un canal, en plus du cas cron. Le README donne l'extrait YAML.
+
 ## Priorités et critères d’acceptation
 
 1. **P0 — robustesse des offres** : test des formats incomplets et des messages multipart; clic accepté/refusé; action acquittée en moins de 3 s; clic répété sans effet métier doublé; action routée vers le bon thread; reprise après redémarrage avec confirmation éditée ou état expiré clairement signalé.
