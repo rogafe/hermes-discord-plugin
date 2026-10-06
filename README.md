@@ -44,6 +44,8 @@ plugins:
         embed_non_model_replies: false  # true = also embed slash-command output (no footer)
         cron_offer_interactions: true   # split numbered Cronjob Response offers into interactive cards
         cron_offer_buttons: true        # route button choices back into Hermes
+        cron_report_pagination: true    # large cron reports become page embeds instead of dozens of cards
+        cron_report_pagination_threshold: 8  # offers needed before pagination kicks in (0 = never paginate)
 ```
 
 Leave Hermes' own text footer (`display.runtime_footer`) off, or its line will show up inside the embed too.
@@ -73,6 +75,14 @@ Offer-card identities and one-action-per-card claims use Hermes' profile-scoped 
 duplicate clicks remain blocked after a gateway restart. Older Hermes versions without that storage API
 fall back to process-local state.
 
+When a report carries more than `cron_report_pagination_threshold` offers, it is delivered as a small number
+of page embeds (packaged under the Discord 2000-character message limit) with persistent ◀/▶ pager buttons
+instead of dozens of per-offer cards. Page content is persisted with the same plugin store, keyed by Discord
+message ID and validated against the channel and job ID on click, so pager buttons keep working after a
+restart; every page turn still goes through the Hermes component authorization check. If the interaction
+route, storage, authorization, or embedding seam is unavailable, the report falls back to the plain
+per-offer cards (or plain text) without losing content.
+
 Multi-message replies receive `Partie 1/N` / `Suite · partie N/N` titles. Cron report fragments retain blank
 lines, indentation, and fenced code blocks, and Markdown headings are converted to bold because Discord
 embeds do not render `#` headings. The visible `⏎` line-break marker found in some cron output is normalized
@@ -93,6 +103,8 @@ Any failure leaves the plain-text reply as it was.
   off rather than showing controls that cannot submit a choice.
 - Offer splitting recognizes the numbered `Cronjob Response` format. Other cron output keeps the regular
   single-reply rendering path.
+- Paginated reports replace the per-offer action buttons with page navigation; the offers are still fully
+  readable, but a choice must be sent as text from that chat.
 
 ## Tests
 

@@ -68,6 +68,14 @@ def build_embed_dict(
     return embed
 
 
+def build_report_embed_dict(
+    page: str, *, color: int, index: int, total: int, job_id: str = "", footer: str = "",
+) -> dict:
+    """Build one page embed of a paginated Cronjob report."""
+    title = f"Cronjob ({job_id}) · page {index + 1}/{total}" if total > 1 else "Cronjob"
+    return build_embed_dict(page, color=color, footer=footer, title=title[:256])
+
+
 def build_offer_embed_dict(
     title: str, body: str, *, color: int, number: int, footer: str = "", job_id: str = "",
 ) -> dict:
