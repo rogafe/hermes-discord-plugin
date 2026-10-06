@@ -18,6 +18,9 @@ PENDING_COMMAND_NAME = "cron-pending"
 PENDING_COMMAND_DESCRIPTION = "List unclaimed cron offer cards in this conversation"
 PENDING_COMMAND_LIMIT = 10
 
+RECOVER_COMMAND_NAME = "cron-recover"
+RECOVER_COMMAND_DESCRIPTION = "Release offer actions/notes interrupted by a gateway stop (outcome unknown)"
+
 
 def _session_keys() -> list[str]:
     """Deduplicated chat/thread ids for the conversation running in this context."""
@@ -66,6 +69,51 @@ def _cron_pending_handler(raw_args: str = "") -> str:
     return "\n".join(lines)
 
 
+def _cron_recover_handler(raw_args: str = "") -> str:
+    """Explicit recovery for clicks that never reached a terminal state.
+
+    An action claim is written before the dispatch, and a crash between claim and
+    finalize leaves the row pending forever: the card then reports "already sent"
+    even though the choice may never have been delivered. This command releases
+    only pending rows older than the recovery grace window, and never silently: it
+    names each released offer and warns that the original outcome is unknown, so
+    re-sending an actually-delivered choice could duplicate the decision.
+    """
+    from .state_store import RECOVERY_GRACE_SECONDS
+
+    keys = _session_keys()
+    if not keys:
+        return "Recovery unavailable outside a Discord conversation."
+    store = OfferStateStore()
+    channel = None
+    for key in keys:
+        if store.stale_interactions(key):
+            channel = key
+            break
+    if channel is None:
+        return (
+            "Nothing to recover: no interrupted offer action or note in this "
+            "conversation."
+        )
+    released = store.release_stale_interactions(channel)
+    if not released:
+        # Everything became terminal between the scan and the release; nothing was erased.
+        return "Nothing to recover in this conversation (state changed while checking)."
+    minutes = RECOVERY_GRACE_SECONDS // 60
+    lines = [
+        f"♻️ {len(released)} interrupted offer interaction(s) released; their outcome is *unknown*:",
+    ]
+    for message_id, job_id, number, kind in released:
+        kind_fr = "action slot" if kind == "action" else "note slot"
+        lines.append(f"• offer {number} — job `{job_id}` — {kind_fr} freed (card {message_id}).")
+    lines.append(
+        "Each one may or may not have been sent to Hermes before the stop; if one was, "
+        "using the freed card again could duplicate the decision. The slots are now free: "
+        f"click again or reply in text. Only items older than ~{minutes} min are affected."
+    )
+    return "\n".join(lines)
+
+
 def register(ctx: Any) -> None:
     """Hermes plugin entry point."""
     tracker = ModelTracker()
@@ -93,3 +141,9 @@ def register(ctx: Any) -> None:
             PENDING_COMMAND_NAME, _cron_pending_handler,
             description=PENDING_COMMAND_DESCRIPTION,
         )
+        # Same seam and same restart caveat: registration is a one-time discovery.
+        if ctx.get_config("cron_recover_command", True):
+            ctx.register_command(
+                RECOVER_COMMAND_NAME, _cron_recover_handler,
+                description=RECOVER_COMMAND_DESCRIPTION,
+            )

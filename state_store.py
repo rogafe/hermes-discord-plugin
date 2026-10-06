@@ -10,14 +10,25 @@ logger = logging.getLogger(__name__)
 _PLUGIN_NAME = "hermes-discord-plugin"
 _DATABASE_LOCK = threading.RLock()
 
+# A pending claim normally resolves (commit on success, release on failure) within
+# seconds of the click: the Discord ack is fast and the Hermes injection is awaited.
+# After this grace, a row still marked 'pending' almost certainly belongs to an
+# interrupted dispatch (process exit between claim and finalize). Its outcome is
+# *unknown* — the choice may or may not have reached Hermes — so the store never
+# releases such rows silently: recovery is only ever triggered explicitly by the
+# user (/cron-recover), which surfaces that uncertainty first.
+RECOVERY_GRACE_SECONDS = 600
+
 
 class OfferStateStore:
     """Use Hermes' SQLite plugin store when available, with a memory fallback on older hosts."""
 
     def __init__(self) -> None:
         self._memory_cards: dict[str, tuple[str, str, int]] = {}
-        self._memory_claims: dict[tuple[str, str, int], str] = {}
-        self._memory_notes: dict[tuple[str, str, int], str] = {}
+        # interaction_id -> claimed_at, so the memory fallback supports the same
+        # stale-claim detection as the SQLite path.
+        self._memory_claims: dict[tuple[str, str, int], tuple[str, int]] = {}
+        self._memory_notes: dict[tuple[str, str, int], tuple[str, int]] = {}
         self._storage_supported: Optional[bool] = None
 
     def register_card(self, message_id: str, channel_id: str, job_id: str, offer_number: int) -> bool:
@@ -84,7 +95,7 @@ class OfferStateStore:
             if connection is None:
                 if key in self._memory_claims:
                     return False
-                self._memory_claims[key] = str(interaction_id)
+                self._memory_claims[key] = (str(interaction_id), int(time.time()))
                 return True
             try:
                 self._ensure_schema(connection)
@@ -114,7 +125,7 @@ class OfferStateStore:
             if connection is None:
                 if key in self._memory_notes:
                     return False
-                self._memory_notes[key] = str(user_id)
+                self._memory_notes[key] = (str(user_id), int(time.time()))
                 return True
             try:
                 self._ensure_schema(connection)
@@ -174,6 +185,167 @@ class OfferStateStore:
             # so a card with a note but no action still counts as pending (annotated 🗒️).
             return [(str(r[0]), str(r[1]), int(r[2]), bool(r[3])) for r in rows]
 
+    def claim_status(
+        self, message_id: str, job_id: str, offer_number: int,
+    ) -> Optional[tuple[str, str, int]]:
+        """Inspect an existing claim: ``(state, action, claimed_at)``, or None when free.
+
+        Lets callers distinguish a live dispatch from a committed action and from a
+        stale pending row left by an interrupted run, instead of reporting a bare
+        "already sent" that may be false.
+        """
+        key = (str(message_id), str(job_id), int(offer_number))
+        with _DATABASE_LOCK:
+            try:
+                connection = self._connection()
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not read offer-action claim", exc_info=True)
+                return None
+            if connection is None:
+                entry = self._memory_claims.get(key)
+                return None if entry is None else ("pending", "", entry[1])
+            try:
+                self._ensure_schema(connection)
+                row = connection.execute(
+                    "SELECT state, action, claimed_at FROM hermes_discord_offer_actions "
+                    "WHERE message_id = ? AND job_id = ? AND offer_number = ?",
+                    key,
+                ).fetchone()
+                return None if row is None else (str(row[0]), str(row[1]), int(row[2]))
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not read offer-action claim", exc_info=True)
+                return None
+
+    def note_status(self, message_id: str, job_id: str, offer_number: int) -> Optional[int]:
+        """Return the ``created_at`` of an existing note reservation, or None when free."""
+        key = (str(message_id), str(job_id), int(offer_number))
+        with _DATABASE_LOCK:
+            try:
+                connection = self._connection()
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not read offer note", exc_info=True)
+                return None
+            if connection is None:
+                entry = self._memory_notes.get(key)
+                return None if entry is None else entry[1]
+            try:
+                self._ensure_schema(connection)
+                row = connection.execute(
+                    "SELECT created_at FROM hermes_discord_offer_notes "
+                    "WHERE message_id = ? AND job_id = ? AND offer_number = ?",
+                    key,
+                ).fetchone()
+                return None if row is None else int(row[0])
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not read offer note", exc_info=True)
+                return None
+
+    def stale_interactions(
+        self, channel_id: str, grace_seconds: int = RECOVERY_GRACE_SECONDS, now: Optional[int] = None,
+    ) -> list[tuple[str, str, int, str]]:
+        """Pending claims and note reservations older than the grace window.
+
+        Returns ``(message_id, job_id, offer_number, kind)`` with kind ``"action"``
+        or ``"note"``. These rows are *not* removed here: their outcome is unknown
+        (the dispatch may have completed just before the process died), so pruning
+        them is left to an explicit :meth:`release_stale_interactions` call.
+        """
+        clock = int(time.time() if now is None else now)
+        cutoff = clock - int(grace_seconds)
+        channel = str(channel_id)
+        stale: list[tuple[str, str, int, str]] = []
+        with _DATABASE_LOCK:
+            try:
+                connection = self._connection()
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not scan stale offer interactions", exc_info=True)
+                return []
+            if connection is None:
+                for key, (_interaction_id, claimed_at) in list(self._memory_claims.items()):
+                    if claimed_at < cutoff and self._memory_card_channel(key[0], key[1]) == channel:
+                        stale.append((key[0], key[1], key[2], "action"))
+                for key, (_user_id, created_at) in list(self._memory_notes.items()):
+                    if created_at < cutoff and self._memory_card_channel(key[0], key[1]) == channel:
+                        stale.append((key[0], key[1], key[2], "note"))
+                return stale
+            try:
+                self._ensure_schema(connection)
+                rows = connection.execute(
+                    "SELECT a.message_id, a.job_id, a.offer_number, 'action' FROM "
+                    "hermes_discord_offer_actions a WHERE a.state = 'pending' AND a.claimed_at < ? "
+                    "AND EXISTS (SELECT 1 FROM hermes_discord_offer_cards c "
+                    "WHERE c.message_id = a.message_id AND c.channel_id = ?) "
+                    "UNION ALL "
+                    "SELECT n.message_id, n.job_id, n.offer_number, 'note' FROM "
+                    "hermes_discord_offer_notes n WHERE n.created_at < ? "
+                    "AND EXISTS (SELECT 1 FROM hermes_discord_offer_cards c "
+                    "WHERE c.message_id = n.message_id AND c.channel_id = ?)",
+                    (cutoff, channel, cutoff, channel),
+                ).fetchall()
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not scan stale offer interactions", exc_info=True)
+                return []
+            return [(str(r[0]), str(r[1]), int(r[2]), str(r[3])) for r in rows]
+
+    def release_stale_interactions(
+        self, channel_id: str, grace_seconds: int = RECOVERY_GRACE_SECONDS, now: Optional[int] = None,
+    ) -> list[tuple[str, str, int, str]]:
+        """Explicitly release stale pending actions and note reservations for a channel.
+
+        Only rows older than the grace window are removed, and only when the user
+        asks for it (``/cron-recover``); the caller must still tell the user the
+        outcome of the original dispatch is unknown. Returns what was released so
+        the decision stays visible rather than silently erased.
+        """
+        released = self.stale_interactions(channel_id, grace_seconds, now)
+        for entry in released:
+            self._unsafe_release(entry, grace_seconds, now)
+        return released
+
+    def _unsafe_release(
+        self, entry: tuple[str, str, int, str], grace_seconds: int = RECOVERY_GRACE_SECONDS,
+        now: Optional[int] = None,
+    ) -> None:
+        """Delete one stale row, still scoped to the cutoff so a claim that turned
+        'committed' (or a note that was just re-reserved) between the scan and this
+        delete is never erased."""
+        message_id, job_id, offer_number, kind = entry
+        key = (message_id, str(job_id), int(offer_number))
+        clock = int(time.time() if now is None else now)
+        cutoff = clock - int(grace_seconds)
+        with _DATABASE_LOCK:
+            try:
+                connection = self._connection()
+                if connection is None:
+                    if kind == "action":
+                        claimed = self._memory_claims.get(key)
+                        if claimed is not None and claimed[1] < cutoff:
+                            self._memory_claims.pop(key, None)
+                    else:
+                        reserved = self._memory_notes.get(key)
+                        if reserved is not None and reserved[1] < cutoff:
+                            self._memory_notes.pop(key, None)
+                    return
+                self._ensure_schema(connection)
+                table = ("hermes_discord_offer_actions", "hermes_discord_offer_notes")[kind == "note"]
+                time_column = "claimed_at" if kind == "action" else "created_at"
+                state_clause = " AND state = 'pending'" if kind == "action" else ""
+                connection.execute(
+                    f"DELETE FROM {table} "  # noqa: S608 — table chosen from a fixed pair
+                    f"WHERE message_id = ? AND job_id = ? AND offer_number = ?{state_clause} "
+                    f"AND {time_column} < ?",
+                    (*key, cutoff),
+                )
+                connection.commit()
+            except Exception:
+                logger.warning("hermes-discord-plugin: could not release stale offer interaction", exc_info=True)
+
+    def _memory_card_channel(self, message_id: str, job_id: str) -> Optional[str]:
+        registered = self._memory_cards.get(message_id)
+        if registered is not None and registered[1] == str(job_id):
+            return registered[0]
+        return None
+
     def remove_note(self, message_id: str, job_id: str, offer_number: int) -> None:
         """Release the note slot after a failed injection so the user can retry."""
         key = (str(message_id), str(job_id), int(offer_number))
@@ -215,7 +387,8 @@ class OfferStateStore:
             try:
                 connection = self._connection()
                 if connection is None:
-                    if self._memory_claims.get(key) == str(interaction_id):
+                    entry = self._memory_claims.get(key)
+                    if entry is not None and entry[0] == str(interaction_id):
                         self._memory_claims.pop(key, None)
                     return
                 self._ensure_schema(connection)
