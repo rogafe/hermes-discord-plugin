@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
 from .chunking import split_markdown
+from .markdown import prepare_adapter_markdown
 from .message_model import MessageDocument, Offer, Segment
 from .interaction_router import InteractionRouter
 from .models import ModelTracker
@@ -63,6 +64,8 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
     async def send(chat_id, content, reply_to=None, metadata=None):
         if isinstance(content, str) and bool(metadata and metadata.get("notify")):
             content = _normalize_cron_linebreak_markers(content)
+            if _setting_bool(get_setting, "enabled", True):
+                content = prepare_adapter_markdown(content)
         if (
             isinstance(content, str)
             and bool(metadata and metadata.get("notify"))
@@ -89,15 +92,19 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
         if bool(metadata and metadata.get("notify")) and getattr(result, "success", False):
             await _embed_reply(
                 state, chat_id=chat_id, metadata=metadata, message_ids=_sent_message_ids(result),
+                adapter_chunks=_adapter_chunks(adapter, content),
             )
         return result
 
     async def edit_message(chat_id, message_id, content, *, finalize=False, **kwargs):
+        if finalize and isinstance(content, str) and _setting_bool(get_setting, "enabled", True):
+            content = prepare_adapter_markdown(content)
         result = await original_edit(chat_id, message_id, content, finalize=finalize, **kwargs)
         if finalize and getattr(result, "success", False):
             await _embed_reply(
                 state, chat_id=chat_id, metadata=kwargs.get("metadata"),
                 message_ids=_edited_message_ids(result, message_id),
+                adapter_chunks=_adapter_chunks(adapter, content),
             )
         return result
 
@@ -134,6 +141,7 @@ async def _send_chunked_reply(
     if isinstance(channel, discord.ForumChannel):
         return None  # a forum send creates one post per call; fragments would become separate posts
     ids: list[str] = []
+    adapter_chunks: list[str] = []
     result = None
     for index, chunk in enumerate(chunks):
         result = await original_send(
@@ -143,6 +151,9 @@ async def _send_chunked_reply(
             logger.warning("hermes-discord-plugin: chunked reply delivery failed at part %d", index + 1)
             return result
         ids.extend(_sent_message_ids(result))
+        expected = _adapter_chunks(adapter, chunk)
+        if expected is not None:
+            adapter_chunks.extend(expected)
     if ids:
         try:
             result.message_id = ids[0]
@@ -153,7 +164,8 @@ async def _send_chunked_reply(
                 result.raw_response = {"message_ids": ids}
         except Exception:
             logger.warning("hermes-discord-plugin: adapter send result could not be aggregated")
-        await _embed_reply(state, chat_id=chat_id, metadata=metadata, message_ids=ids)
+        await _embed_reply(state, chat_id=chat_id, metadata=metadata, message_ids=ids,
+                           adapter_chunks=adapter_chunks or None)
     return result
 
 
@@ -165,7 +177,7 @@ async def _send_cron_offer_segments(
     tracker = state.tracker
     model_keys = _route_keys(chat_id, metadata)
     # Consume once for the whole logical response so the model footer cannot leak to a later turn.
-    model = tracker.take(model_keys)
+    model = None if _is_cron_delivery(metadata) else tracker.take(model_keys)
     pg_threshold = _setting_int(state.get_setting, "cron_report_pagination_threshold", 8)
     pg_enabled = pg_threshold > 0 and _setting_bool(
         state.get_setting, "cron_report_pagination", True,
@@ -277,7 +289,7 @@ async def _decorate_paginated_report(
     total = len(pages)
     for index, (page, message_id) in enumerate(zip(pages, message_ids)):
         message = await _resolve_message(state.bot, channel, message_id)
-        if message is None or not message.content or message.embeds:
+        if message is None or not message.content:
             continue
         embed_data = build_report_embed_dict(
             _normalize_embed_markdown(page), color=color,
@@ -407,7 +419,7 @@ async def _decorate_cron_segments(
 
     for segment, message_id in all_ids:
         message = await _resolve_message(state.bot, channel, message_id)
-        if message is None or not message.content or message.embeds:
+        if message is None or not message.content:
             continue
         is_last = message_id == last_id
         message_footer = footer if is_last else ""
@@ -804,10 +816,14 @@ async def _authorized_component(adapter: Any, interaction: Any) -> bool:
         logger.warning("hermes-discord-plugin: Hermes component authorization helper is unavailable")
         return False
     try:
+        kwargs = {}
+        if "live_auth" in inspect.signature(checker).parameters:
+            kwargs["live_auth"] = getattr(adapter, "_component_live_auth", None)
         result = checker(
             interaction,
             getattr(adapter, "_allowed_user_ids", set()),
             getattr(adapter, "_allowed_role_ids", set()),
+            **kwargs,
         )
         if inspect.isawaitable(result):
             result = await result
@@ -842,35 +858,44 @@ def _install_interaction_listener(state: _AdapterState) -> None:
 
 async def _embed_reply(
     state: _AdapterState, *, chat_id: Any, metadata: Optional[dict], message_ids: list[str],
+    adapter_chunks: Optional[list[str]] = None,
 ) -> None:
     keys = _route_keys(chat_id, metadata)
-    model = state.tracker.take(keys)
+    cron_delivery = _is_cron_delivery(metadata)
+    model = None if cron_delivery else state.tracker.take(keys)
     try:
         if not _setting_bool(state.get_setting, "enabled", True) or not message_ids:
             return
-        if not model and not _setting_bool(state.get_setting, "embed_non_model_replies", False):
+        if not model and not cron_delivery and not _setting_bool(state.get_setting, "embed_non_model_replies", False):
             return
         footer = footer_text(model, state.get_setting("footer_template", None))
         color = parse_color(state.get_setting("color", None))
-        await _edit_into_embeds(state.bot, keys, message_ids, footer=footer, color=color)
+        await _edit_into_embeds(state.bot, keys, message_ids, footer=footer, color=color,
+                                adapter_chunks=adapter_chunks)
     except Exception as exc:
         logger.warning("hermes-discord-plugin: embed conversion failed: %s", exc)
 
 
 async def _edit_into_embeds(
     bot: Any, channel_keys: Iterable[str], message_ids: list[str], *, footer: str, color: int,
+    adapter_chunks: Optional[list[str]] = None,
 ) -> None:
     import discord
 
     channel = await _resolve_channel(bot, channel_keys)
     if channel is None or isinstance(channel, discord.ForumChannel):
         return
+    messages = [await _resolve_message(bot, channel, message_id) for message_id in message_ids]
+    contents = _without_adapter_indicators(
+        [message.content if message is not None else "" for message in messages], adapter_chunks,
+    )
     last = len(message_ids) - 1
-    for index, message_id in enumerate(message_ids):
-        message = await _resolve_message(bot, channel, message_id)
-        if message is None or not message.content or message.embeds:
+    for index, (message, content) in enumerate(zip(messages, contents)):
+        # Link previews also populate embeds. An already converted reply has no
+        # text; previews are replaced by our reply embed with its clickable links.
+        if message is None or not message.content:
             continue
-        document = parse_message(message.content)
+        document = parse_message(content)
         segment = document.segments[0] if document.segments else None
         is_notice = segment is not None and segment.kind in {"alert", "confirmation"}
         if is_notice:
@@ -882,12 +907,41 @@ async def _edit_into_embeds(
         else:
             title = ""
         embed = build_embed_dict(
-            _normalize_embed_markdown(segment.text if is_notice else message.content),
+            _normalize_embed_markdown(segment.text if is_notice else content),
             color=segment.color if is_notice and segment.color is not None else color,
             footer=footer if index == last else "",
             title=title,
         )
         await message.edit(content=None, embed=discord.Embed.from_dict(embed))
+
+
+def _is_cron_delivery(metadata: Optional[dict]) -> bool:
+    """The scheduler supplies job_id even when no Discord model hook ran."""
+    return bool(metadata and isinstance(metadata.get("job_id"), str) and metadata["job_id"])
+
+
+def _adapter_chunks(adapter: Any, content: Any) -> Optional[list[str]]:
+    """Reproduce the adapter's formatting to establish indicator provenance."""
+    formatter = getattr(adapter, "format_message", None)
+    splitter = getattr(adapter, "truncate_message", None)
+    if not isinstance(content, str) or not callable(formatter) or not callable(splitter):
+        return None
+    try:
+        return splitter(formatter(content), _positive_int(
+            getattr(adapter, "MAX_MESSAGE_LENGTH", None), MESSAGE_LIMIT,
+        ))
+    except Exception:
+        return None
+
+
+def _without_adapter_indicators(contents: list[str], expected: Optional[list[str]]) -> list[str]:
+    """Only remove suffixes proven to come from the adapter's full split output."""
+    if expected is None or contents != expected or len(contents) < 2:
+        return contents
+    suffixes = [f" ({index + 1}/{len(contents)})" for index in range(len(contents))]
+    if not all(content.endswith(suffix) for content, suffix in zip(contents, suffixes)):
+        return contents
+    return [content[:-len(suffix)] for content, suffix in zip(contents, suffixes)]
 
 
 def _normalize_cron_linebreak_markers(content: str) -> str:
@@ -908,7 +962,15 @@ def _normalize_embed_markdown(content: str) -> str:
         elif in_fence:
             lines.append(line)
         else:
-            lines.append(re.sub(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", r"**\1**", line))
+            heading = re.match(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", line)
+            if heading:
+                title = heading.group(1)
+                # Wrapping existing strong emphasis produces unsupported nested
+                # delimiters such as ****Carrefour** (Metz)** in Discord.
+                has_bold = re.search(r"\*\*.+?\*\*|__.+?__", title)
+                lines.append(title if has_bold else f"**{title}**")
+            else:
+                lines.append(line)
     return "\n".join(lines)
 
 
@@ -972,10 +1034,25 @@ def _interaction_route_ready(adapter: Any) -> bool:
 
 
 def _component_auth_checker(adapter: Any) -> Any:
+    import importlib
     import sys
 
-    module = sys.modules.get(type(adapter).__module__)
-    return getattr(module, "_component_check_auth", None) if module else None
+    # Hermes moved the helper from adapter.py to adapter_component_auth.py.
+    # Walk the MRO so adapter subclasses still use their owning Hermes helper.
+    for cls in type(adapter).__mro__:
+        module = sys.modules.get(cls.__module__)
+        checker = getattr(module, "_component_check_auth", None)
+        if callable(checker):
+            return checker
+        if cls.__module__ == "plugins.platforms.discord.adapter":
+            try:
+                module = importlib.import_module("plugins.platforms.discord.adapter_component_auth")
+            except ImportError:
+                continue
+            checker = getattr(module, "_component_check_auth", None)
+            if callable(checker):
+                return checker
+    return None
 
 
 def _positive_int(value: Any, default: int) -> int:
