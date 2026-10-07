@@ -10,7 +10,7 @@ from typing import Any
 
 from .embeds import install
 from .models import ModelTracker, current_discord_route
-from .outbound_policy import guard_current_conversation_send
+from .outbound_policy import current_conversation_reminder, guard_current_conversation_send
 from .state_store import OfferStateStore
 
 logger = logging.getLogger(__name__)
@@ -129,6 +129,7 @@ def register(ctx: Any) -> None:
         install(bot, adapter, tracker=tracker, get_setting=ctx.get_config)
 
     ctx.register_hook("post_llm_call", on_post_llm_call)
+    ctx.register_hook("pre_llm_call", current_conversation_reminder)
     ctx.register_hook("pre_tool_call", guard_current_conversation_send)
     ctx.register_platform_handler("discord", wire_discord)
     # Official plugin-command seam: Hermes discovers this once, guards built-in name conflicts,
