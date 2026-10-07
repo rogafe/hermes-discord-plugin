@@ -1,7 +1,8 @@
 # hermes-discord-plugin
 
 Renders [Hermes Agent](https://github.com/NousResearch/hermes-agent)'s Discord replies as **embeds**, with the
-model that answered in the embed footer:
+model that answered in the embed footer. Fenced code and prompts stay in native message text by default
+so they can be copied on mobile:
 
 ```
 ┃ Here's the summary you asked for…
@@ -64,6 +65,7 @@ plugins:
     hermes-discord-plugin:
       settings:
         enabled: true                   # false = plain-text replies again
+        render_mode: auto               # auto = fenced replies plain; embed = always embed; plain = native text
         footer_template: "{model}"      # {model} = "claude-opus-5-5", {model_full} = "anthropic/claude-opus-5-5"
         color: "#5865F2"                # embed bar color
         embed_non_model_replies: false  # true = also embed slash-command output (no footer)
@@ -78,6 +80,28 @@ plugins:
 ```
 
 Leave Hermes' own text footer (`display.runtime_footer`) off, or its line will show up inside the embed too.
+
+## Copyable replies and delivery
+
+In `auto` mode, replies containing a fenced code block (backticks or tildes) stay as native Discord
+message content. Ordinary replies and interactive cron reports retain their embeds. `plain` also
+disables cron cards and pagers; `embed` restores the previous always-embed behavior.
+
+For one explicit plain-text reply, the agent can put `[[discord:plain]]` alone on the first line of
+its final response. The plugin removes that line before final delivery. `[[discord:embed]]` forces an
+embed for one reply. Integration code can instead set `metadata.discord_render_mode` to `plain` or
+`embed`; metadata takes precedence over the marker, then the configured mode. The same policy applies
+to finalized streamed replies and long replies. Intermediate streamed text can briefly show the marker
+before finalization. Markers quoted later in a reply are ordinary text.
+
+Reply to the current conversation through Hermes' normal final response. The plugin's `pre_tool_call`
+hook blocks Discord MCP `send_message` calls into that conversation: a personal-account MCP post looks
+like a new human message to the gateway and can make the agent answer itself or execute a quoted prompt.
+Reads, reactions, and sends to other destinations retain their normal authorization. The guard depends
+on Hermes' task-local Discord route; calls without that context cannot be matched to a conversation.
+
+On mobile, prefer short paragraphs and lists to wide tables. Native message content avoids placing
+copyable payloads inside embeds, but exact copy gestures still depend on the Discord iOS/Android client.
 
 ## Slash command
 
@@ -122,6 +146,9 @@ Hermes has no hook for changing how a reply is sent, so the plugin uses two supp
    missed-message ledger); once a *final* reply (`metadata["notify"]`, or a finalized streamed message) has
    been delivered, the plugin edits those messages in place into embeds, putting the model in the footer
    of the last one.
+
+The `pre_tool_call` policy hook separately prevents personal-account Discord MCP sends to the current
+gateway conversation. It does not change inbound authorization or discard messages from the human user.
 
 For a final cron message that starts with `Cronjob Response:` and includes a `job_id`, the wrapper recognizes
 numbered offer headings (`**[N] Title**`), sends the report introduction, each offer, and the report summary
