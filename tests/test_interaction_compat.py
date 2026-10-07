@@ -82,7 +82,7 @@ def test_modern_gateway_sends_interactive_cards_and_pages_with_previews(modern_e
 
     channel.post = post
     report = 'Cronjob Response:\n(job_id: audit_test)\n' + '\n'.join(
-        f'**[{number}] Offre {number}**\n' + 'Description détaillée. ' * 25 + '\nhttps://example.com/offre\n'
+        f'**[{number}] Offre {number}**\n' + 'Description détaillée. ' * 25 + '\n```text\nDétails\n```\nhttps://example.com/offre\n'
         for number in range(1, count + 1)
     )
     result = asyncio.run(adapter.send('42', report, metadata={'notify': True, 'job_id': 'audit_test'}))
@@ -97,6 +97,29 @@ def test_modern_gateway_sends_interactive_cards_and_pages_with_previews(modern_e
     else:
         assert any(value.startswith('hermes_pager|') for value in prefixes)
         assert len(messages) < count
+
+
+@pytest.mark.parametrize('mode', ['setting', 'metadata', 'marker'])
+def test_plain_mode_bypasses_interactive_cron_cards(modern_env, mode):
+    embeds, adapter, bot, channel, calls = modern_env
+    tracker = adapter._hermes_discord_embeds.tracker
+    tracker.record(('42',), 'unrelated-model')
+    metadata = {'notify': True, 'job_id': 'plain_test'}
+    report = 'Cronjob Response:\n(job_id: plain_test)\n**[1] Offre**\nhttps://example.com/offre'
+    if mode == 'setting':
+        embeds.install(bot, adapter, tracker=tracker, get_setting=_settings(render_mode='plain'))
+    elif mode == 'metadata':
+        metadata['discord_render_mode'] = 'plain'
+    else:
+        report = '[[discord:plain]]\n' + report
+    result = asyncio.run(adapter.send('42', report, metadata=metadata))
+    assert result.success
+    messages = list(channel.messages.values())
+    assert len(messages) == 1
+    assert messages[0].content.startswith('Cronjob Response:')
+    assert not messages[0].embeds and not messages[0].edits
+    # Scheduled deliveries must not consume an unrelated interactive turn's model.
+    assert tracker.take(('42',)) == 'unrelated-model'
 
 
 def test_legacy_helper_remains_supported(modern_env, monkeypatch):
