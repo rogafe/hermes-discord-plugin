@@ -296,3 +296,87 @@ def test_long_reply_over_adapter_cap_falls_back(env):
     _tracker.record((str(CHANNEL_ID),), "m")
     result = run(adapter.send(str(CHANNEL_ID), "word " * 1500, metadata={"notify": True}))
     assert len(result.raw_response["message_ids"]) == 4  # adapter's own splitting, untouched
+
+
+def test_link_preview_does_not_prevent_final_embed(env):
+    setup, channel, tracker = env
+    adapter = setup()
+    original_post = channel.post
+
+    def post(content):
+        message = original_post(content)
+        message.embeds = [discord.Embed(title="Link preview", url="https://example.com")]
+        return message
+
+    channel.post = post
+    tracker.record((str(CHANNEL_ID),), "m")
+    result = run(adapter.send(str(CHANNEL_ID), "Read https://example.com", metadata={"notify": True}))
+    message = channel.messages[int(result.message_id)]
+    assert message.content == ""
+    assert message.embeds[0].description == "Read https://example.com"
+    assert message.embeds[0].footer.text == "m"
+
+
+def test_scheduler_cron_embeds_without_discord_model(env):
+    setup, channel, tracker = env
+    adapter = setup()
+    tracker.record((str(CHANNEL_ID),), "unrelated-discord-model")
+    text = "Cronjob Response: Veille\n(job_id: job1)\n\nRésultat sans offres."
+    result = run(adapter.send(str(CHANNEL_ID), text, metadata={"notify": True, "job_id": "job1"}))
+    message = channel.messages[int(result.message_id)]
+    assert message.content == ""
+    assert message.embeds[0].description == text
+    assert message.embeds[0].footer.text is None
+    assert tracker.take((str(CHANNEL_ID),)) == "unrelated-discord-model"
+
+
+def test_scheduler_cron_without_any_model_embeds(env):
+    setup, channel, _tracker = env
+    adapter = setup()
+    result = run(adapter.send(str(CHANNEL_ID), "Cron report", metadata={"notify": True, "job_id": "job1"}))
+    assert channel.messages[int(result.message_id)].embeds[0].description == "Cron report"
+
+
+def test_marker_cleanup_requires_adapter_provenance(plugin):
+    embeds = importlib.import_module(f"{plugin.__name__}.embeds")
+    chunks = ["First (1/2)", "Second (2/2)"]
+    assert embeds._without_adapter_indicators(chunks, ["First (1/2)", "Second (2/2)"]) == ["First", "Second"]
+    assert embeds._without_adapter_indicators(chunks, None) == chunks
+    # A fraction belonging to the source survives, even before the adapter's own suffix.
+    chunks = ["First (1/2) (1/2)", "Second (2/2)"]
+    assert embeds._without_adapter_indicators(chunks, chunks) == ["First (1/2)", "Second"]
+    assert embeds._without_adapter_indicators(["First (1/2)", "Changed (2/2)"], ["First (1/2)", "Second (2/2)"]) == ["First (1/2)", "Changed (2/2)"]
+
+
+def test_adapter_numbering_is_removed_through_public_send(plugin):
+    embeds = importlib.import_module(f"{plugin.__name__}.embeds")
+    models = importlib.import_module(f"{plugin.__name__}.models")
+    channel = FakeChannel(CHANNEL_ID)
+
+    class NumberedAdapter(FakeAdapter):
+        MAX_MESSAGE_LENGTH = 2000
+
+        @staticmethod
+        def format_message(content):
+            return content
+
+        @staticmethod
+        def truncate_message(content, limit):
+            chunks = [content[i:i + limit - 10] for i in range(0, len(content), limit - 10)]
+            return [f"{chunk} ({i + 1}/{len(chunks)})" for i, chunk in enumerate(chunks)] if len(chunks) > 1 else chunks
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH)
+            ids = [str(channel.post(chunk).id) for chunk in chunks]
+            return SendResult(True, ids[0], {"message_ids": ids})
+
+    adapter = NumberedAdapter(channel)
+    tracker = models.ModelTracker()
+    tracker.record((str(CHANNEL_ID),), 'model')
+    embeds.install(FakeBot(channel), adapter, tracker=tracker, get_setting=_settings(long_reply_chunking=False))
+    run(adapter.send(str(CHANNEL_ID), 'Original (1/2) ' + 'a' * 2500, metadata={'notify': True}))
+    first, last = list(channel.messages.values())
+    assert first.embeds[0].description.startswith('Original (1/2) ')
+    assert not first.embeds[0].description.endswith(' (1/2)')
+    assert not last.embeds[0].description.endswith(' (2/2)')
+    assert first.embeds[0].title == 'Partie 1/2'
