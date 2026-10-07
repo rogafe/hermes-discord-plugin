@@ -1,5 +1,5 @@
 name: hermes-discord-plugin
-version: 0.3.3
+version: 0.3.4
 manifest_version: 2
 api_version: 1
 description: "Render Discord replies as embeds and add interactive cards to numbered cron offers."
@@ -10,6 +10,7 @@ tags: [gateway, discord]
 
 provides_hooks:
   - post_llm_call
+  - pre_llm_call
   - pre_tool_call
 
 # No extra Python dependencies: discord.py ships with Hermes' Discord adapter.
