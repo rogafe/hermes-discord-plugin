@@ -80,6 +80,111 @@ class FakeAdapter:
 CHANNEL_ID = 42
 
 
+@pytest.mark.parametrize("delivery", ["send", "stream"])
+@pytest.mark.parametrize(
+    "settings,override,text,plain",
+    [
+        ({}, None, "Here is the prompt:\n```text\nUse this exact prompt.\n```", True),
+        ({}, None, "~~~python\nprint('hello')\n~~~", True),
+        ({}, None, "```text\nAn unclosed prompt", True),
+        ({}, None, "Use `inline code` in a normal reply.", False),
+        ({"render_mode": "plain"}, None, "A normal reply", True),
+        ({"render_mode": "embed"}, None, "```text\nA prompt\n```", False),
+        ({"render_mode": "embed"}, "plain", "A normal reply", True),
+        ({"render_mode": "plain"}, "embed", "```text\nA prompt\n```", False),
+        ({"render_mode": "invalid"}, None, "```text\nA prompt\n```", True),
+        ({"render_mode": "plain"}, "invalid", "A normal reply", True),
+        ({}, "plain", "| Key | Value |\n| --- | --- |\n| A | B |", True),
+    ],
+)
+def test_render_policy_for_final_sends_and_streams(env, delivery, settings, override, text, plain):
+    setup, channel, tracker = env
+    adapter = setup(**settings)
+    metadata = {"notify": True}
+    if override is not None:
+        metadata["discord_render_mode"] = override
+    tracker.record((str(CHANNEL_ID),), "m")
+    if delivery == "send":
+        result = run(adapter.send(str(CHANNEL_ID), text, metadata=metadata))
+        message = channel.messages[int(result.message_id)]
+    else:
+        message = channel.post("partial…")
+        result = run(adapter.edit_message(str(CHANNEL_ID), str(message.id), text,
+                                         finalize=True, metadata=metadata))
+    assert result.success
+    if plain:
+        assert message.content == text
+        assert not message.embeds
+    else:
+        assert message.content == ""
+        assert message.embeds[0].footer.text == "m"
+    assert tracker.take((str(CHANNEL_ID),)) is None
+    # The bypassed response's footer must not attach to an unrelated later reply.
+    next_result = run(adapter.send(str(CHANNEL_ID), "Next reply", metadata={"notify": True}))
+    assert not channel.messages[int(next_result.message_id)].embeds
+
+
+def test_auto_plain_long_fenced_reply_consumes_tracker_once(env):
+    setup, channel, tracker = env
+    adapter = setup()
+    takes = []
+    original_take = tracker.take
+
+    def take(keys):
+        takes.append(keys)
+        return original_take(keys)
+
+    tracker.take = take
+    tracker.record((str(CHANNEL_ID),), "m")
+    text = "Here is the prompt:\n```text\n" + "Keep this line intact.\n" * 160 + "```"
+    result = run(adapter.send(str(CHANNEL_ID), text, metadata={"notify": True}))
+    messages = [channel.messages[int(i)] for i in result.raw_response["message_ids"]]
+    assert len(messages) > 1
+    assert all(message.content and not message.embeds for message in messages)
+    assert all(len(message.content) <= 2000 for message in messages)
+    assert all(message.content.count("```") % 2 == 0 for message in messages)
+    assert len(takes) == 1
+
+
+@pytest.mark.parametrize("delivery", ["send", "stream"])
+@pytest.mark.parametrize(
+    "marker,override,plain",
+    [("plain", None, True), ("embed", None, False), ("plain", "embed", False),
+     ("embed", "plain", True)],
+)
+def test_final_reply_render_marker_is_stripped(env, delivery, marker, override, plain):
+    setup, channel, tracker = env
+    adapter = setup(render_mode="embed" if marker == "plain" else "plain")
+    tracker.record((str(CHANNEL_ID),), "m")
+    body = "```text\nCopy this prompt.\n```"
+    text = f"[[discord:{marker}]]\n{body}"
+    metadata = {"notify": True, "discord_render_mode": override}
+    if delivery == "send":
+        result = run(adapter.send(str(CHANNEL_ID), text, metadata=metadata))
+        message = channel.messages[int(result.message_id)]
+    else:
+        message = channel.post("partial")
+        run(adapter.edit_message(str(CHANNEL_ID), str(message.id), text,
+                                 finalize=True, metadata=metadata))
+    assert (message.content if plain else message.embeds[0].description) == body
+    assert bool(message.embeds) == (not plain)
+    assert tracker.take((str(CHANNEL_ID),)) is None
+
+
+def test_render_marker_is_only_consumed_on_first_line_of_final_reply(env):
+    setup, channel, tracker = env
+    adapter = setup()
+    tracker.record((str(CHANNEL_ID),), "m")
+    text = "[[discord:plain]]\nTool progress"
+    result = run(adapter.send(str(CHANNEL_ID), text))
+    assert channel.messages[int(result.message_id)].content == text
+    assert tracker.take((str(CHANNEL_ID),)) == "m"
+    tracker.record((str(CHANNEL_ID),), "m")
+    text = "Quoted marker:\n[[discord:plain]]"
+    result = run(adapter.send(str(CHANNEL_ID), text, metadata={"notify": True}))
+    assert channel.messages[int(result.message_id)].embeds[0].description == text
+
+
 def _settings(**overrides):
     values = {"enabled": True, "footer_template": "{model}", "color": "#112233",
               "embed_non_model_replies": False, **overrides}

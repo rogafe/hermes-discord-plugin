@@ -62,15 +62,18 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
     original_edit = adapter.edit_message
 
     async def send(chat_id, content, reply_to=None, metadata=None):
+        render_plain = False
         if isinstance(content, str) and bool(metadata and metadata.get("notify")):
             content = _normalize_cron_linebreak_markers(content)
-            if _setting_bool(get_setting, "enabled", True):
+            content, render_plain = _reply_render_policy(state, content, metadata)
+            if not render_plain and _setting_bool(get_setting, "enabled", True):
                 content = prepare_adapter_markdown(content)
         if (
             isinstance(content, str)
             and bool(metadata and metadata.get("notify"))
             and _setting_bool(get_setting, "enabled", True)
             and _setting_bool(get_setting, "cron_offer_interactions", True)
+            and not render_plain
         ):
             document = parse_message(content)
             if document.source_format == "cron_offer_report" and document.segments:
@@ -84,7 +87,9 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
             and _setting_bool(get_setting, "enabled", True)
             and _setting_bool(get_setting, "long_reply_chunking", True)
         ):
-            chunked = await _send_chunked_reply(state, original_send, chat_id, content, reply_to, metadata)
+            chunked = await _send_chunked_reply(
+                state, original_send, chat_id, content, reply_to, metadata, render_plain=render_plain,
+            )
             if chunked is not None:
                 return chunked
 
@@ -93,30 +98,61 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
             await _embed_reply(
                 state, chat_id=chat_id, metadata=metadata, message_ids=_sent_message_ids(result),
                 adapter_chunks=_adapter_chunks(adapter, content),
+                render_plain=render_plain,
             )
         return result
 
     async def edit_message(chat_id, message_id, content, *, finalize=False, **kwargs):
-        if finalize and isinstance(content, str) and _setting_bool(get_setting, "enabled", True):
-            content = prepare_adapter_markdown(content)
+        render_plain = False
+        if finalize and isinstance(content, str):
+            content, render_plain = _reply_render_policy(state, content, kwargs.get("metadata"))
+            if not render_plain and _setting_bool(get_setting, "enabled", True):
+                content = prepare_adapter_markdown(content)
         result = await original_edit(chat_id, message_id, content, finalize=finalize, **kwargs)
         if finalize and getattr(result, "success", False):
             await _embed_reply(
                 state, chat_id=chat_id, metadata=kwargs.get("metadata"),
                 message_ids=_edited_message_ids(result, message_id),
                 adapter_chunks=_adapter_chunks(adapter, content),
+                render_plain=render_plain,
             )
         return result
 
     adapter.send = send
     adapter.edit_message = edit_message
     _install_interaction_listener(state)
-    logger.info("hermes-discord-plugin: final Discord replies will render as embeds")
+    logger.info("hermes-discord-plugin: final Discord reply rendering installed")
+
+
+def _reply_render_policy(
+    state: _AdapterState, content: str, metadata: Optional[dict],
+) -> tuple[str, bool]:
+    """Choose once per logical reply, before formatting or splitting its copyable text."""
+    marker = re.match(r"\A\[\[discord:(plain|embed)\]\](?:\r?\n|\Z)", content)
+    marker_mode = None
+    if marker:
+        marker_mode = marker.group(1)
+        content = content[marker.end():]
+    override = (metadata or {}).get("discord_render_mode")
+    if override in ("plain", "embed"):
+        mode = override
+    elif marker_mode:
+        mode = marker_mode
+    else:
+        mode = state.get_setting("render_mode", "auto")
+        if mode not in ("auto", "plain", "embed"):
+            mode = "auto"
+    if mode == "auto":
+        # Reports keep their cards/pagers; all other fenced payloads stay copyable.
+        report = parse_message(content).source_format == "cron_offer_report"
+        return content, not report and any(is_fence_boundary(line) for line in content.splitlines())
+    return content, mode == "plain"
 
 
 async def _send_chunked_reply(
     state: _AdapterState, original_send: Callable, chat_id: Any, content: str,
     reply_to: Any, metadata: Optional[dict],
+    *, render_plain: bool = False,
 ) -> Any:
     """Pre-split a long final reply on Markdown boundaries; ``None`` leaves it to the adapter.
 
@@ -165,7 +201,7 @@ async def _send_chunked_reply(
         except Exception:
             logger.warning("hermes-discord-plugin: adapter send result could not be aggregated")
         await _embed_reply(state, chat_id=chat_id, metadata=metadata, message_ids=ids,
-                           adapter_chunks=adapter_chunks or None)
+                           adapter_chunks=adapter_chunks or None, render_plain=render_plain)
     return result
 
 
@@ -859,11 +895,14 @@ def _install_interaction_listener(state: _AdapterState) -> None:
 async def _embed_reply(
     state: _AdapterState, *, chat_id: Any, metadata: Optional[dict], message_ids: list[str],
     adapter_chunks: Optional[list[str]] = None,
+    render_plain: bool = False,
 ) -> None:
     keys = _route_keys(chat_id, metadata)
     cron_delivery = _is_cron_delivery(metadata)
     model = None if cron_delivery else state.tracker.take(keys)
     try:
+        if render_plain:
+            return
         if not _setting_bool(state.get_setting, "enabled", True) or not message_ids:
             return
         if not model and not cron_delivery and not _setting_bool(state.get_setting, "embed_non_model_replies", False):
