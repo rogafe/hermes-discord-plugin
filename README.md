@@ -12,6 +12,12 @@ model that answered in the embed footer:
 Tool progress, typing indicators, approval prompts and other intermediate messages are left alone; only the
 final reply of each turn is converted.
 
+Scheduler deliveries carrying `metadata.job_id` also render as embeds, even without a Discord model
+hook; no model footer is invented for them. Automatic Discord link previews are replaced by the reply
+embed, which retains the clickable links. Existing bold headings and table labels keep a single layer
+of emphasis. Adapter-generated multipart suffixes are removed only when the delivered text exactly
+matches the adapter split; numbering remains in the embed title.
+
 To keep tool activity out of Discord while retaining it in Hermes' log, configure the gateway's display
 settings (these are Hermes settings, not plugin settings) in the profile's `config.yaml`:
 
