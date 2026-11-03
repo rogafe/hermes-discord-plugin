@@ -1,8 +1,8 @@
 name: hermes-discord-plugin
-version: 0.3.4
+version: 0.4.0
 manifest_version: 2
 api_version: 1
-description: "Render Discord replies as embeds and add interactive cards to numbered cron offers."
+description: "Render Discord replies as Components V2 cards (or embeds) and add interactive cards to numbered cron offers."
 author: rogafe
 kind: standalone
 platforms: [linux, macos, windows]
@@ -26,6 +26,16 @@ config_schema:
     default: "auto"
     label: "Reply rendering mode"
     description: "auto keeps fenced code/prompts as native copyable messages and embeds other replies; embed forces embeds; plain keeps all replies as native messages. Explicit reply overrides take precedence."
+  layout:
+    type: str
+    default: "components"
+    label: "Reply layout"
+    description: "components = Components V2 cards (real headings, lists, link buttons, small footer); embeds = the previous embed rendering. A components edit that Discord refuses falls back to an embed."
+  notification_cards:
+    type: bool
+    default: true
+    label: "Webhook notification cards"
+    description: "Turn direct webhook notifications that use the '📌 **source** — title (date)' template into cards with a link button (components layout only)."
   footer_template:
     type: str
     default: "{model}"

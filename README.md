@@ -65,6 +65,8 @@ plugins:
     hermes-discord-plugin:
       settings:
         enabled: true                   # false = plain-text replies again
+        layout: components              # components = Components V2 cards; embeds = previous embed rendering
+        notification_cards: true        # 📌 webhook notifications become link cards (components layout)
         render_mode: auto               # auto = fenced replies plain; embed = always embed; plain = native text
         footer_template: "{model}"      # {model} = "claude-opus-5-5", {model_full} = "anthropic/claude-opus-5-5"
         color: "#5865F2"                # embed bar color
@@ -80,6 +82,27 @@ plugins:
 ```
 
 Leave Hermes' own text footer (`display.runtime_footer`) off, or its line will show up inside the embed too.
+
+## Components V2 layout
+
+With `layout: components` (the default), final replies are edited into a
+[Components V2](https://docs.discord.com/developers/components/reference) message instead of an embed: an
+accent-colored container whose Text Displays render real `#`/`##`/`###` headings, lists and `-#` subtext,
+which embeds cannot. The model goes into a small `-# 🤖 model` footer; a first line that is only `**Title**`
+is promoted to a heading, and `•` bullets become Markdown lists.
+
+- **Cron reports**: Hermes' `Cronjob Response: … (job_id: …) ---` header and the English
+  "To stop or manage this job…" hint are removed. The job name becomes a small kicker line, standalone
+  `Label : <url>` lines become link buttons, and the job id and delivery time go into the footer.
+- **Webhook notifications** (`deliver_only` routes using `📌 **{source}** — {title} ({date})\n{summary}\n{link}`)
+  become link cards: source, platform and relative date in the kicker, a deduplicated title (producers often send
+  `title = summary[:120]`), trailing hashtags as subtext, and a "Voir sur Facebook" / "Voir le panneau" button.
+  The broken Facebook "Log in or sign up" preview disappears because the edit clears embeds.
+
+Discord only lets a message gain the `IS_COMPONENTS_V2` flag, never lose it, and requires content and embeds to be
+cleared in the same edit. The plugin uses that seam: Hermes still sends the text (reply references, ledger,
+retries), then the plugin edits it. If Discord refuses the edit, the embed path runs as before. Offer cards and
+paginated reports keep their embeds and buttons. A converted message shows Discord's "(edited)" marker.
 
 ## Copyable replies and delivery
 

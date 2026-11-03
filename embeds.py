@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
 from .chunking import split_markdown
+from .components import (
+    build_cron_layout, build_notification_layout, build_reply_layout, edit_payload, fits,
+    parse_notification, promote_bold_title, strip_cron_trailer, strip_cron_wrapper,
+)
 from .markdown import prepare_adapter_markdown
 from .message_model import MessageDocument, Offer, Segment
 from .interaction_router import InteractionRouter
@@ -62,6 +66,19 @@ def install(bot: Any, adapter: Any, *, tracker: ModelTracker, get_setting: GetSe
     original_edit = adapter.edit_message
 
     async def send(chat_id, content, reply_to=None, metadata=None):
+        if (
+            isinstance(content, str)
+            and not bool(metadata and metadata.get("notify"))
+            and _setting_bool(get_setting, "enabled", True)
+            and _setting_bool(get_setting, "notification_cards", True)
+            and _layout(get_setting) == "components"
+        ):
+            note = parse_notification(content)
+            if note is not None:
+                result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+                if getattr(result, "success", False):
+                    await _edit_into_notification(state, chat_id, metadata, _sent_message_ids(result), note)
+                return result
         render_plain = False
         if isinstance(content, str) and bool(metadata and metadata.get("notify")):
             content = _normalize_cron_linebreak_markers(content)
@@ -910,14 +927,14 @@ async def _embed_reply(
         footer = footer_text(model, state.get_setting("footer_template", None))
         color = parse_color(state.get_setting("color", None))
         await _edit_into_embeds(state.bot, keys, message_ids, footer=footer, color=color,
-                                adapter_chunks=adapter_chunks)
+                                adapter_chunks=adapter_chunks, layout=_layout(state.get_setting))
     except Exception as exc:
         logger.warning("hermes-discord-plugin: embed conversion failed: %s", exc)
 
 
 async def _edit_into_embeds(
     bot: Any, channel_keys: Iterable[str], message_ids: list[str], *, footer: str, color: int,
-    adapter_chunks: Optional[list[str]] = None,
+    adapter_chunks: Optional[list[str]] = None, layout: str = "embeds",
 ) -> None:
     import discord
 
@@ -929,6 +946,7 @@ async def _edit_into_embeds(
         [message.content if message is not None else "" for message in messages], adapter_chunks,
     )
     last = len(message_ids) - 1
+    cron = strip_cron_wrapper(contents[0]) if contents and contents[0] else None
     for index, (message, content) in enumerate(zip(messages, contents)):
         # Link previews also populate embeds. An already converted reply has no
         # text; previews are replaced by our reply embed with its clickable links.
@@ -937,6 +955,13 @@ async def _edit_into_embeds(
         document = parse_message(content)
         segment = document.segments[0] if document.segments else None
         is_notice = segment is not None and segment.kind in {"alert", "confirmation"}
+        if layout == "components":
+            components = _reply_components(
+                content, message, index=index, total=len(message_ids), footer=footer, color=color,
+                cron=cron, notice=segment if is_notice else None,
+            )
+            if components is not None and await _edit_components(bot, channel, message, components):
+                continue
         if is_notice:
             title = segment.title
             if len(message_ids) > 1:
@@ -952,6 +977,85 @@ async def _edit_into_embeds(
             title=title,
         )
         await message.edit(content=None, embed=discord.Embed.from_dict(embed))
+
+
+def _reply_components(
+    content: str, message: Any, *, index: int, total: int, footer: str, color: int,
+    cron: Any = None, notice: Any = None,
+) -> Optional[list[dict]]:
+    """Components V2 layout for one delivered part, or ``None`` to keep the embed path."""
+    last = index == total - 1
+    label = f"Partie {index + 1}/{total}" if total > 1 else ""
+    if cron is not None:
+        body = cron.body if index == 0 else content
+        if last:
+            body = strip_cron_trailer(body)
+        created = getattr(message, "created_at", None)
+        components = build_cron_layout(
+            body, color=color,
+            name=cron.name if index == 0 else "",
+            job_id=cron.job_id if last else "",
+            footer=footer if last else "",
+            timestamp=int(created.timestamp()) if last and created is not None else None,
+            label=label,
+        )
+    elif notice is not None:
+        components = build_reply_layout(
+            notice.text, color=notice.color if notice.color is not None else color,
+            footer=f"🤖 {footer}" if footer and last else "", label=label, title=notice.title,
+        )
+    else:
+        components = build_reply_layout(
+            promote_bold_title(content) if index == 0 else content, color=color,
+            footer=f"🤖 {footer}" if footer and last else "", label=label,
+        )
+    return components if fits(components) else None
+
+
+async def _edit_components(bot: Any, channel: Any, message: Any, components: list[dict]) -> bool:
+    """Edit a delivered message into a Components V2 layout; ``False`` keeps the caller's fallback.
+
+    discord.py's ``Message.edit`` needs ``ui`` objects; the raw route keeps the layouts pure dicts.
+    """
+    http = getattr(bot, "http", None)
+    if http is None or not callable(getattr(http, "request", None)):
+        return False
+    try:
+        from discord.http import Route
+
+        flags = getattr(getattr(message, "flags", None), "value", 0) or 0
+        route = Route(
+            "PATCH", "/channels/{channel_id}/messages/{message_id}",
+            channel_id=getattr(channel, "id", None) or message.channel.id, message_id=message.id,
+        )
+        await http.request(route, json=edit_payload(components, flags))
+        return True
+    except Exception as exc:
+        logger.warning("hermes-discord-plugin: components layout edit failed, keeping embeds: %s", exc)
+        return False
+
+
+async def _edit_into_notification(
+    state: _AdapterState, chat_id: Any, metadata: Optional[dict], message_ids: list[str], note: Any,
+) -> None:
+    """Turn a direct webhook notification (one message, no model) into a link card."""
+    if len(message_ids) != 1:
+        return  # the adapter split it; leave the text intact rather than editing half a card
+    try:
+        channel = await _resolve_channel(state.bot, _route_keys(chat_id, metadata))
+        message = await _resolve_message(state.bot, channel, message_ids[0]) if channel else None
+        if message is None:
+            return
+        components = build_notification_layout(note)
+        if fits(components):
+            await _edit_components(state.bot, channel, message, components)
+    except Exception as exc:
+        logger.warning("hermes-discord-plugin: notification card failed: %s", exc)
+
+
+def _layout(get_setting: GetSetting) -> str:
+    value = str(get_setting("layout", "components") or "components").strip().lower()
+    return value if value in {"components", "embeds"} else "components"
 
 
 def _is_cron_delivery(metadata: Optional[dict]) -> bool:
